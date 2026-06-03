@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Allow: /quiz
+Allow: /recall
+
+# Sitemap Direction
+Sitemap: https://explainote.ai/sitemap.xml
