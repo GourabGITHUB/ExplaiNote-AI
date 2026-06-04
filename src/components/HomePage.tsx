@@ -26,7 +26,7 @@ const faqs = [
 ];
 
 export default function HomePage() {
-  const [openFaq, setOpenFaq] = useState<number | null>(null);
+  const [openFaq, setOpenFaq] = useState<number | null>(0);
 
   return (
     <div className="page-container">
@@ -122,25 +122,40 @@ export default function HomePage() {
         Frequently Asked Questions
       </h2>
       <div className="faq-list">
-        {faqs.map((faq, i) => (
-          <div key={i} className={`faq-item ${openFaq === i ? 'open' : ''}`}>
-            <button
-              className="faq-question"
-              onClick={() => setOpenFaq(openFaq === i ? null : i)}
-            >
-              <span>{faq.q}</span>
-              <span className="faq-chevron">
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <polyline points="6 9 12 15 18 9"/>
-                </svg>
-              </span>
-            </button>
-            {openFaq === i && (
-              <div className="faq-answer">{faq.a}</div>
-            )}
-          </div>
-        ))}
+  {faqs.map((faq, i) => (
+    <div
+      key={i}
+      className={`faq-item ${openFaq === i ? 'open' : ''}`}
+    >
+      <button
+        className="faq-question"
+        onClick={() => setOpenFaq(openFaq === i ? null : i)}
+        aria-expanded={openFaq === i}
+      >
+        <span>{faq.q}</span>
+
+        <span className="faq-chevron">
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </span>
+      </button>
+
+      <div className="faq-answer">
+        {faq.a}
       </div>
+    </div>
+  ))}
+</div>
       {/* Footer */}
 <footer className="home-footer">
   <p>
