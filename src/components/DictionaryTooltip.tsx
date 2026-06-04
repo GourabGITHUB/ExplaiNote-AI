@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, type RefObject } from 'react';
 
 interface TooltipData {
   word: string;
@@ -8,11 +8,164 @@ interface TooltipData {
   x: number;
   y: number;
   arrowX: number;
+  width: number;
 }
 
 interface DictionaryTooltipProps {
-  containerRef: React.RefObject<HTMLDivElement | null>;
+  containerRef: RefObject<HTMLDivElement | null>;
 }
+
+interface TapRecord {
+  time: number;
+  x: number;
+  y: number;
+}
+
+type CaretCapableDocument = Document & {
+  caretPositionFromPoint?: (
+    x: number,
+    y: number
+  ) => { offsetNode: Node; offset: number } | null;
+  caretRangeFromPoint?: (x: number, y: number) => Range | null;
+};
+
+// ── constants ──────────────────────────────────────────────────────────
+const DOUBLE_TAP_MAX_DELAY = 400; // ms between two taps
+const DOUBLE_TAP_MAX_DISTANCE = 25; // px drift tolerance between taps
+const TAP_MAX_DURATION = 300; // ms – a single press must be shorter than this
+const TAP_MAX_MOVE = 10; // px – movement within a single press
+
+const INTERACTIVE_SELECTOR = [
+  'button',
+  'input',
+  'textarea',
+  'select',
+  'option',
+  'label',
+  'a',
+  'summary',
+  '[role="button"]',
+  '[role="link"]',
+  '[contenteditable="true"]',
+  '[contenteditable=""]',
+  '[data-no-dictionary-tooltip="true"]',
+].join(', ');
+
+// ── helpers ────────────────────────────────────────────────────────────
+
+function isIgnoredTarget(target: EventTarget | null): boolean {
+  const el =
+    target instanceof HTMLElement
+      ? target
+      : target instanceof Node
+        ? target.parentElement
+        : null;
+  if (!el) return true;
+  return !!el.closest(INTERACTIVE_SELECTOR);
+}
+
+function isWordChar(ch: string): boolean {
+  return /[A-Za-z'-]/.test(ch);
+}
+
+function findTextNode(node: Node, backward = false): Text | null {
+  if (node.nodeType === Node.TEXT_NODE) return node as Text;
+  const kids = Array.from(node.childNodes);
+  if (backward) kids.reverse();
+  for (const child of kids) {
+    const found = findTextNode(child, backward);
+    if (found) return found;
+  }
+  return null;
+}
+
+function resolveTextPosition(
+  node: Node,
+  offset: number
+): { node: Text; offset: number } | null {
+  if (node.nodeType === Node.TEXT_NODE) {
+    const len = node.textContent?.length ?? 0;
+    return { node: node as Text, offset: Math.max(0, Math.min(offset, len)) };
+  }
+
+  const kids = node.childNodes;
+  if (!kids.length) return null;
+
+  const idx = Math.max(0, Math.min(offset, kids.length - 1));
+  const next = findTextNode(kids[idx], false);
+  if (next) return { node: next, offset: 0 };
+
+  const prev = findTextNode(kids[Math.max(0, idx - 1)], true);
+  if (prev) return { node: prev, offset: prev.textContent?.length ?? 0 };
+
+  const any = findTextNode(node, false);
+  return any ? { node: any, offset: 0 } : null;
+}
+
+function getWordBounds(
+  text: string,
+  rawOffset: number
+): { word: string; start: number; end: number } | null {
+  if (!text) return null;
+  let off = rawOffset;
+  if (off >= text.length) off = text.length - 1;
+  if (off < 0) return null;
+
+  if (!isWordChar(text[off])) {
+    if (off > 0 && isWordChar(text[off - 1])) off -= 1;
+    else return null;
+  }
+
+  let start = off;
+  let end = off + 1;
+  while (start > 0 && isWordChar(text[start - 1])) start--;
+  while (end < text.length && isWordChar(text[end])) end++;
+
+  const word = text.slice(start, end).trim();
+  return word ? { word, start, end } : null;
+}
+
+function getWordAtPoint(
+  clientX: number,
+  clientY: number
+): { word: string; rect: DOMRect } | null {
+  const doc = document as CaretCapableDocument;
+
+  let caretNode: Node | null = null;
+  let caretOffset = 0;
+
+  const pos = doc.caretPositionFromPoint?.(clientX, clientY);
+  if (pos) {
+    caretNode = pos.offsetNode;
+    caretOffset = pos.offset;
+  } else {
+    const range = doc.caretRangeFromPoint?.(clientX, clientY);
+    if (range) {
+      caretNode = range.startContainer;
+      caretOffset = range.startOffset;
+    }
+  }
+
+  if (!caretNode) return null;
+
+  const resolved = resolveTextPosition(caretNode, caretOffset);
+  if (!resolved) return null;
+
+  const text = resolved.node.textContent ?? '';
+  const bounds = getWordBounds(text, resolved.offset);
+  if (!bounds) return null;
+
+  const range = document.createRange();
+  range.setStart(resolved.node, bounds.start);
+  range.setEnd(resolved.node, bounds.end);
+
+  const rect = range.getBoundingClientRect();
+  if (!rect || (rect.width === 0 && rect.height === 0)) return null;
+
+  return { word: bounds.word, rect };
+}
+
+// ── component ──────────────────────────────────────────────────────────
 
 export default function DictionaryTooltip({ containerRef }: DictionaryTooltipProps) {
   const [tooltip, setTooltip] = useState<TooltipData | null>(null);
@@ -21,168 +174,253 @@ export default function DictionaryTooltip({ containerRef }: DictionaryTooltipPro
   const tooltipRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
+  // double-tap state kept in refs so the pointer handler never goes stale
+  const lastTapRef = useRef<TapRecord | null>(null);
+  const pressStartRef = useRef<{
+    time: number;
+    x: number;
+    y: number;
+    pointerId: number;
+    moved: boolean;
+  } | null>(null);
+
+  // ── dismiss ──────────────────────────────────────────────────────────
   const dismiss = useCallback(() => {
     setTooltip(null);
     setLoading(false);
     setError('');
-    if (abortRef.current) {
-      abortRef.current.abort();
-      abortRef.current = null;
-    }
+    abortRef.current?.abort();
+    abortRef.current = null;
   }, []);
 
-  const fetchDefinition = useCallback(async (word: string, rect: DOMRect) => {
-    const cleanWord = word.replace(/[^a-zA-Z'-]/g, '').toLowerCase();
-    if (!cleanWord || cleanWord.length < 2 || cleanWord.length > 40) return;
+  // ── fetch ────────────────────────────────────────────────────────────
+  const fetchDefinition = useCallback(
+    async (word: string, rect: DOMRect) => {
+      const page = containerRef.current;
+      if (!page) return;
 
-    // Abort any previous fetch
-    if (abortRef.current) abortRef.current.abort();
-    abortRef.current = new AbortController();
+      const clean = word.replace(/[^a-zA-Z'-]/g, '').toLowerCase();
+      if (!clean || clean.length < 2 || clean.length > 40) return;
 
-    setLoading(true);
-    setError('');
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
 
-    // Calculate position relative to the page-container (our positioned parent)
-    const pageContainer = containerRef.current;
-    if (!pageContainer) return;
+      setLoading(true);
+      setError('');
 
-    const parentRect = pageContainer.getBoundingClientRect();
+      const parentRect = page.getBoundingClientRect();
+      const pad = 4;
+      const available = parentRect.width - pad * 2;
+      if (available <= 0) {
+        setLoading(false);
+        return;
+      }
 
-    // Word position relative to the page-container
-    const wordCenterX = rect.left + rect.width / 2 - parentRect.left;
-    const wordTopY = rect.top - parentRect.top;
+      const tipW = Math.min(320, available);
+      const wordCX = rect.left + rect.width / 2 - parentRect.left;
+      const wordTY = rect.top - parentRect.top;
 
-    // Tooltip width — clamp X so it doesn't overflow the container
-    const tooltipWidth = 320;
-    const containerWidth = parentRect.width;
-    let tooltipX = wordCenterX - tooltipWidth / 2;
-    tooltipX = Math.max(4, Math.min(tooltipX, containerWidth - tooltipWidth - 4));
+      let tipX = wordCX - tipW / 2;
+      tipX = Math.max(pad, Math.min(tipX, parentRect.width - tipW - pad));
 
-    // Arrow points to the word center
-    const arrowX = Math.max(16, Math.min(wordCenterX - tooltipX, tooltipWidth - 16));
-
-    // Set a preliminary tooltip to show loading state
-    setTooltip({
-      word: cleanWord,
-      definition: '',
-      partOfSpeech: '',
-      phonetic: '',
-      x: tooltipX,
-      y: wordTopY,
-      arrowX,
-    });
-
-    try {
-      const res = await fetch(
-        `https://api.dictionaryapi.dev/api/v2/entries/en/${cleanWord}`,
-        { signal: abortRef.current.signal }
+      const arrowPad = Math.min(16, Math.max(8, tipW / 2));
+      const arrowX = Math.max(
+        arrowPad,
+        Math.min(wordCX - tipX, tipW - arrowPad)
       );
 
-      if (!res.ok) {
-        setError('No definition found');
-        setLoading(false);
-        return;
-      }
-
-      const data = await res.json();
-      const entry = data[0];
-      const firstMeaning = entry?.meanings?.[0];
-      const definition = firstMeaning?.definitions?.[0]?.definition;
-      const partOfSpeech = firstMeaning?.partOfSpeech || '';
-      const phonetic = entry?.phonetic || entry?.phonetics?.[0]?.text || '';
-
-      if (!definition) {
-        setError('No definition found');
-        setLoading(false);
-        return;
-      }
-
       setTooltip({
-        word: cleanWord,
-        definition,
-        partOfSpeech,
-        phonetic,
-        x: tooltipX,
-        y: wordTopY,
+        word: clean,
+        definition: '',
+        partOfSpeech: '',
+        phonetic: '',
+        x: tipX,
+        y: wordTY,
         arrowX,
+        width: tipW,
       });
-      setLoading(false);
-      setError('');
-    } catch (err: any) {
-      if (err.name === 'AbortError') return;
-      setError('Failed to fetch definition');
-      setLoading(false);
-    }
-  }, [containerRef]);
 
+      try {
+        const res = await fetch(
+          `https://api.dictionaryapi.dev/api/v2/entries/en/${clean}`,
+          { signal: controller.signal }
+        );
+
+        if (!res.ok) {
+          setError('No definition found');
+          setLoading(false);
+          return;
+        }
+
+        const data = await res.json();
+        const entry = data?.[0];
+        const meaning = entry?.meanings?.[0];
+        const definition = meaning?.definitions?.[0]?.definition;
+        const partOfSpeech = meaning?.partOfSpeech || '';
+        const phonetic = entry?.phonetic || entry?.phonetics?.[0]?.text || '';
+
+        if (!definition) {
+          setError('No definition found');
+          setLoading(false);
+          return;
+        }
+
+        setTooltip({
+          word: clean,
+          definition,
+          partOfSpeech,
+          phonetic,
+          x: tipX,
+          y: wordTY,
+          arrowX,
+          width: tipW,
+        });
+        setLoading(false);
+        setError('');
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        setError('Failed to fetch definition');
+        setLoading(false);
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    },
+    [containerRef]
+  );
+
+  // ── cleanup abort on unmount ─────────────────────────────────────────
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  // ── unified pointer-based double-tap detector ────────────────────────
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
 
-    const handleDoubleClick = (e: MouseEvent) => {
-      // Don't trigger on buttons, inputs, textareas
-      const target = e.target as HTMLElement;
-      if (
-        target.tagName === 'BUTTON' ||
-        target.tagName === 'INPUT' ||
-        target.tagName === 'TEXTAREA' ||
-        target.closest('button') ||
-        target.closest('input') ||
-        target.closest('textarea')
-      ) {
+    const onPointerDown = (e: PointerEvent) => {
+      if (isIgnoredTarget(e.target)) return;
+      if (tooltipRef.current?.contains(e.target as Node)) return;
+
+      pressStartRef.current = {
+        time: Date.now(),
+        x: e.clientX,
+        y: e.clientY,
+        pointerId: e.pointerId,
+        moved: false,
+      };
+    };
+
+    const onPointerMove = (e: PointerEvent) => {
+      const start = pressStartRef.current;
+      if (!start || start.pointerId !== e.pointerId) return;
+
+      const dx = Math.abs(e.clientX - start.x);
+      const dy = Math.abs(e.clientY - start.y);
+      if (dx > TAP_MAX_MOVE || dy > TAP_MAX_MOVE) {
+        start.moved = true;
+      }
+    };
+
+    const onPointerUp = (e: PointerEvent) => {
+      const start = pressStartRef.current;
+      if (!start || start.pointerId !== e.pointerId) return;
+      pressStartRef.current = null;
+
+      // Was this press short and stationary enough to count as a "tap"?
+      const duration = Date.now() - start.time;
+      if (start.moved || duration > TAP_MAX_DURATION) {
+        // Not a tap → reset the double-tap chain
+        lastTapRef.current = null;
         return;
       }
 
-      // Get the selected word from browser selection
-      const selection = window.getSelection();
-      if (!selection || selection.isCollapsed) return;
+      const thisTap: TapRecord = {
+        time: Date.now(),
+        x: e.clientX,
+        y: e.clientY,
+      };
 
-      const selectedText = selection.toString().trim();
-      // Only handle single words
-      if (!selectedText || selectedText.includes(' ') || selectedText.length < 2) return;
+      const prev = lastTapRef.current;
 
-      const range = selection.getRangeAt(0);
-      const rect = range.getBoundingClientRect();
+      if (prev) {
+        const dt = thisTap.time - prev.time;
+        const dist = Math.hypot(thisTap.x - prev.x, thisTap.y - prev.y);
 
-      fetchDefinition(selectedText, rect);
+        if (dt <= DOUBLE_TAP_MAX_DELAY && dist <= DOUBLE_TAP_MAX_DISTANCE) {
+          // ✅ double-tap detected
+          lastTapRef.current = null; // reset so triple-tap doesn't re-fire
+
+          // Attempt to get the word at the pointer location
+          const result = getWordAtPoint(e.clientX, e.clientY);
+          if (result) {
+            fetchDefinition(result.word, result.rect);
+          }
+          return;
+        }
+      }
+
+      // First tap (or previous tap was too old / too far) — record it
+      lastTapRef.current = thisTap;
     };
 
-    container.addEventListener('dblclick', handleDoubleClick);
-    return () => container.removeEventListener('dblclick', handleDoubleClick);
+    const onPointerCancel = () => {
+      pressStartRef.current = null;
+    };
+
+    container.addEventListener('pointerdown', onPointerDown);
+    container.addEventListener('pointermove', onPointerMove);
+    container.addEventListener('pointerup', onPointerUp);
+    container.addEventListener('pointercancel', onPointerCancel);
+
+    return () => {
+      container.removeEventListener('pointerdown', onPointerDown);
+      container.removeEventListener('pointermove', onPointerMove);
+      container.removeEventListener('pointerup', onPointerUp);
+      container.removeEventListener('pointercancel', onPointerCancel);
+    };
   }, [containerRef, fetchDefinition]);
 
-  // Dismiss on click outside or scroll
+  // ── dismiss on outside interaction / scroll / resize / escape ────────
   useEffect(() => {
     if (!tooltip) return;
 
-    const handleClickOutside = (e: MouseEvent) => {
-      if (tooltipRef.current && !tooltipRef.current.contains(e.target as Node)) {
-        dismiss();
-      }
+    const handleOutside = (e: Event) => {
+      const target = e.target;
+      if (!(target instanceof Node)) return;
+      if (tooltipRef.current?.contains(target)) return;
+      dismiss();
     };
 
     const handleScroll = () => dismiss();
+    const handleResize = () => dismiss();
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') dismiss();
     };
 
-    // Delay adding the click listener so the dblclick doesn't immediately dismiss
-    const timer = setTimeout(() => {
-      document.addEventListener('mousedown', handleClickOutside);
-    }, 100);
+    const scrollEl = containerRef.current?.closest('.main-content');
 
-    const scrollContainer = containerRef.current?.closest('.main-content');
-    scrollContainer?.addEventListener('scroll', handleScroll, { passive: true });
+    // Small delay so the pointer-up that opened the tooltip doesn't
+    // immediately close it via the outside-click listener
+    const timer = window.setTimeout(() => {
+      document.addEventListener('pointerdown', handleOutside);
+    }, 150);
+
+    scrollEl?.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('scroll', handleScroll, { passive: true });
+    window.addEventListener('resize', handleResize, { passive: true });
     document.addEventListener('keydown', handleKey);
 
     return () => {
       clearTimeout(timer);
-      document.removeEventListener('mousedown', handleClickOutside);
-      scrollContainer?.removeEventListener('scroll', handleScroll);
+      document.removeEventListener('pointerdown', handleOutside);
+      scrollEl?.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('scroll', handleScroll);
+      window.removeEventListener('resize', handleResize);
       document.removeEventListener('keydown', handleKey);
     };
   }, [tooltip, dismiss, containerRef]);
 
+  // ── render ───────────────────────────────────────────────────────────
   if (!tooltip) return null;
 
   return (
@@ -192,6 +430,8 @@ export default function DictionaryTooltip({ containerRef }: DictionaryTooltipPro
       style={{
         left: tooltip.x,
         top: tooltip.y,
+        width: tooltip.width,
+        maxWidth: 'calc(100% - 6px)',
       }}
     >
       <div className="dict-tooltip-arrow" style={{ left: tooltip.arrowX }} />
@@ -205,6 +445,7 @@ export default function DictionaryTooltip({ containerRef }: DictionaryTooltipPro
             className="dict-tooltip-close"
             onClick={dismiss}
             aria-label="Close"
+            type="button"
           >
             ×
           </button>
@@ -218,9 +459,7 @@ export default function DictionaryTooltip({ containerRef }: DictionaryTooltipPro
         )}
 
         {error && !loading && (
-          <div className="dict-tooltip-error">
-            {error}
-          </div>
+          <div className="dict-tooltip-error">{error}</div>
         )}
 
         {!loading && !error && tooltip.definition && (
