@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 
 export default function TallyFeedbackButton({
   formId = "dWzxAK",
-  buttonText = "Give Feedback",
+  buttonText = "Feedback",
 }) {
   const [userIp, setUserIp] = useState("unknown");
 

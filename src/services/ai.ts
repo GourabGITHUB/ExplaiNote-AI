@@ -53,34 +53,18 @@ function deduplicatedRequest<T>(key: string, producer: () => Promise<T>): Promis
 
 // ============ SECTION EXPAND THROTTLE ============
 
-/**
- * Micro-jitter delay + sequential queue for section recall requests.
- *
- * Problem: When a user rapidly clicks 4 section expanders within ~50ms,
- * each click resolves its await buildCacheKey() at slightly different times,
- * so they all miss the dedup map and fire 4 parallel API calls → instant
- * rate-limit on the free tier.
- *
- * Solution: A tiny queue that spaces section requests apart by at least
- * SECTION_JITTER_MS. The first request goes immediately; subsequent ones
- * wait for the previous to start + jitter.
- */
 const SECTION_JITTER_MS = 350;
 let sectionQueueTail: Promise<void> = Promise.resolve();
 
 function enqueueSectionRequest<T>(fn: () => Promise<T>): Promise<T> {
-  // Chain onto the tail: wait for previous section to START (not finish),
-  // then add jitter, then run ours.
   const result = sectionQueueTail.then(async () => {
     await sleep(SECTION_JITTER_MS);
     return fn();
   });
 
-  // Update the tail to track when THIS request's jitter has elapsed
-  // (not when the API call finishes — we don't want to serialize fully)
   sectionQueueTail = sectionQueueTail
     .then(() => sleep(SECTION_JITTER_MS))
-    .catch(() => {}); // swallow errors so the queue never jams
+    .catch(() => {});
 
   return result;
 }
@@ -89,8 +73,30 @@ function enqueueSectionRequest<T>(fn: () => Promise<T>): Promise<T> {
 
 const CACHE_VERSION = 'v1';
 
+/**
+ * Normalizes text for cache key generation.
+ *
+ * CRITICAL — must produce identical output regardless of:
+ *  - Local dev vs Cloudflare edge (different V8 builds)
+ *  - OS-level line ending differences (\r\n vs \n)
+ *  - Unicode whitespace variants injected by PDF parsers, OCR, or
+ *    edge request body normalization
+ *
+ * Steps:
+ *  1. Strip ALL Unicode whitespace variants to a single ASCII space
+ *     (covers \u00A0 NBSP, \u2000–\u200A typographic spaces,
+ *      \u2028 line sep, \u2029 paragraph sep, \u202F narrow NBSP,
+ *      \u205F medium math space, \u3000 ideographic space, \uFEFF BOM)
+ *  2. Collapse consecutive spaces
+ *  3. Lowercase
+ *  4. Trim
+ */
 function normalizeTextForHashing(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+  return text
+    // Replace ALL Unicode whitespace with ASCII space
+    .replace(/[\s\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/g, ' ')
+    .toLowerCase()
+    .trim();
 }
 
 async function sha256(input: string): Promise<string> {
@@ -278,6 +284,7 @@ function fixUnescapedQuotes(text: string): string {
         next === ',' ||
         next === '}' ||
         next === ']' ||
+        next === ':' ||
         next === '';
 
       if (isClosingQuote) {
@@ -298,8 +305,21 @@ function fixUnescapedQuotes(text: string): string {
   return result;
 }
 
-function peekNextNonWhitespace(text: string, fromIndex: number): string {
-  for (let j = fromIndex; j < text.length; j++) {
+/**
+ * Peeks ahead past whitespace to find the next meaningful character.
+ *
+ * Safety: bounded by maxLookahead to prevent runaway scans on
+ * truncated text where a quote lands at the very edge of the buffer.
+ * Returns '' if nothing found within the window — callers treat
+ * '' as "end of input / closing quote" which is the safe default.
+ */
+function peekNextNonWhitespace(
+  text: string,
+  fromIndex: number,
+  maxLookahead: number = 64
+): string {
+  const limit = Math.min(fromIndex + maxLookahead, text.length);
+  for (let j = fromIndex; j < limit; j++) {
     if (!/\s/.test(text[j])) return text[j];
   }
   return '';
@@ -309,19 +329,34 @@ function removeTrailingCommas(text: string): string {
   return text.replace(/,(\s*[}\]])/g, '$1');
 }
 
+/**
+ * Extracts balanced JSON from opening bracket to its matched closer.
+ *
+ * Safety: bounded by MAX_SCAN_LENGTH to prevent infinite loops on
+ * pathologically malformed input. If the text is longer than the
+ * limit, we scan up to the limit and return null (triggering
+ * truncation repair downstream).
+ */
 function extractBalanced(
   text: string,
   startIdx: number,
   openChar: string,
   closeChar: string
 ): string | null {
+  const MAX_SCAN_LENGTH = 500_000; // 500KB — well above any realistic response
   let depth = 0;
   let insideString = false;
   let i = startIdx;
+  const end = Math.min(text.length, startIdx + MAX_SCAN_LENGTH);
 
-  while (i < text.length) {
+  while (i < end) {
     const char = text[i];
-    if (char === '\\' && insideString) { i += 2; continue; }
+    if (char === '\\' && insideString) {
+      // Safety: if escape char is at the very last position, break
+      if (i + 1 >= end) break;
+      i += 2;
+      continue;
+    }
     if (char === '"') { insideString = !insideString; i++; continue; }
     if (!insideString) {
       if (char === openChar)  depth++;
@@ -331,7 +366,7 @@ function extractBalanced(
     i++;
   }
 
-  return null;
+  return null; // unbalanced or exceeded scan limit — triggers truncation repair
 }
 
 function attemptTruncationRepair(text: string): string {
@@ -388,40 +423,63 @@ function extractJSON(text: string): string {
   return cleaned;
 }
 
+/**
+ * Sequential cascading JSON repair pipeline.
+ *
+ * Each stage feeds its output into the next, so a response with
+ * multiple issues (raw newlines + trailing commas + rogue quotes)
+ * gets all fixes applied cumulatively.
+ *
+ * We try JSON.parse after EVERY stage so clean responses exit early.
+ * An alt pipeline (truncation-first) runs as a final fallback for
+ * responses truncated mid-string.
+ */
 function safeParseJSON<T>(text: string): T {
-  const s1 = stripRogueCharacters(text);
-  const s2 = normalizeLiteralWhitespace(s1);
-  const s3 = removeTrailingCommas(s2);
-  const s4 = attemptTruncationRepair(s2);
-  const s5 = fixUnescapedQuotes(s2);
-  const s6 = removeTrailingCommas(s5);
-  const s7 = attemptTruncationRepair(s5);
-  const s8 = removeTrailingCommas(attemptTruncationRepair(fixUnescapedQuotes(s2)));
-
-  const strategies: Array<{ name: string; value: string }> = [
-    { name: 'raw',                                        value: text },
-    { name: 'strip-rogue-chars',                          value: s1   },
-    { name: 'normalize-whitespace',                       value: s2   },
-    { name: 'normalize + remove-trailing-commas',         value: s3   },
-    { name: 'normalize + truncation-repair',              value: s4   },
-    { name: 'normalize + fix-quotes',                     value: s5   },
-    { name: 'normalize + fix-quotes + remove-commas',     value: s6   },
-    { name: 'normalize + fix-quotes + truncation-repair', value: s7   },
-    { name: 'full-pipeline',                              value: s8   },
+  const stages: Array<{
+    name: string;
+    transform: (input: string) => string;
+  }> = [
+    { name: 'raw',                      transform: (s) => s                           },
+    { name: 'strip-rogue-chars',        transform: (s) => stripRogueCharacters(s)     },
+    { name: '+ normalize-whitespace',   transform: (s) => normalizeLiteralWhitespace(s) },
+    { name: '+ remove-trailing-commas', transform: (s) => removeTrailingCommas(s)     },
+    { name: '+ fix-unescaped-quotes',   transform: (s) => fixUnescapedQuotes(s)       },
+    { name: '+ truncation-repair',      transform: (s) => attemptTruncationRepair(s)  },
   ];
 
   const errors: string[] = [];
+  let current = text;
 
-  for (const strategy of strategies) {
+  for (const stage of stages) {
+    current = stage.transform(current);
+
     try {
-      const parsed = JSON.parse(strategy.value);
-      if (strategy.name !== 'raw') {
-        console.warn(`[safeParseJSON] Recovered using strategy: "${strategy.name}"`);
+      const parsed = JSON.parse(current);
+      if (stage.name !== 'raw') {
+        console.warn(`[safeParseJSON] Recovered at stage: "${stage.name}"`);
       }
       return parsed as T;
     } catch (err: any) {
-      errors.push(`  • [${strategy.name}]: ${err.message}`);
+      errors.push(`  • [${stage.name}]: ${err.message}`);
     }
+  }
+
+  // Alt pipeline: truncation repair BEFORE quote fixing
+  try {
+    const alt = fixUnescapedQuotes(
+      removeTrailingCommas(
+        attemptTruncationRepair(
+          normalizeLiteralWhitespace(
+            stripRogueCharacters(text)
+          )
+        )
+      )
+    );
+    const parsed = JSON.parse(alt);
+    console.warn('[safeParseJSON] Recovered with alt pipeline (truncation-first)');
+    return parsed as T;
+  } catch (err: any) {
+    errors.push(`  • [alt-truncation-first]: ${err.message}`);
   }
 
   throw new Error(
@@ -608,6 +666,18 @@ const sectionRecallResponseSchema = {
   required: ["sectionRecall"]
 };
 
+// ── QUIZ SCHEMAS: ONE UNIFIED SCHEMA FOR ALL TYPES ──
+//
+// The previous approach used anyOf for mixed quizzes, which caused
+// Gemini to silently drop the options field on MCQ questions. The
+// result: validateAndRepairQuiz would filter them out, and users
+// got fewer questions than they asked for.
+//
+// NEW APPROACH: One single schema with options ALWAYS required.
+// The prompt controls which types are generated.
+// validateAndRepairQuiz handles cleanup (e.g. stripping dummy
+// options from short-answer, normalizing true-false options).
+
 const quizQuestionSchema = {
   type: "OBJECT",
   properties: {
@@ -619,7 +689,10 @@ const quizQuestionSchema = {
     explanation:   { type: "STRING" },
     section:       { type: "STRING" }
   },
-  required: ["id", "type", "question", "correctAnswer", "explanation"]
+  // options IS required in the schema — Gemini will ALWAYS return it.
+  // For short-answer, the prompt says to use an empty array [].
+  // validateAndRepairQuiz strips it post-parse.
+  required: ["id", "type", "question", "options", "correctAnswer", "explanation"]
 };
 
 const quizResponseSchema = {
@@ -632,8 +705,6 @@ const quizResponseSchema = {
 
 // ============ SYSTEM INSTRUCTIONS ============
 
-// Shorter system prompts → fewer input tokens per request
-
 const MERGED_SYSTEM_INSTRUCTION = `You are an expert educational content designer.
 
 SUMMARY (Feynman technique): Explain as if teaching a 12-year-old. Use simple language, analogies, examples. Keep every field to 1-2 sentences max.
@@ -644,21 +715,20 @@ CRITICAL: Be extremely concise. Valid JSON only.`;
 
 const SECTION_RECALL_SYSTEM_INSTRUCTION = `You are an active recall expert. Create focused recall questions for one section. Each needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence. Skip empty categories. Valid JSON only.`;
 
-const QUIZ_SYSTEM_INSTRUCTION = `You are a quiz generator. Rules: mcq=4 options, true-false=["True","False"], short-answer=no options+1-3 word answer. Explanations: 1 sentence. Valid JSON only.`;
+const QUIZ_SYSTEM_INSTRUCTION = `You are a quiz generator. STRICT RULES:
+- "mcq": "options" must have EXACTLY 4 strings. correctAnswer must match one option exactly.
+- "true-false": "options" must be ["True", "False"]. correctAnswer must be "True" or "False".
+- "short-answer": "options" must be an empty array []. correctAnswer is 1-3 words.
+- EVERY question MUST have the "options" field (array).
+- Explanations: 1 sentence max.
+Valid JSON only.`;
 
 // ============ INPUT BUDGET CONSTANTS ============
 
-/**
- * Maximum characters sent to Gemini per request type.
- *
- * Free-tier Gemini 2.5 Flash: 1M token context, but output is capped at
- * ~8192 tokens. Our real bottleneck is OUTPUT tokens + rate limits.
- * Smaller inputs = faster responses + less chance of truncation.
- */
 const INPUT_LIMITS = {
-  merged:  10000,   // summary + big picture
-  section: 2000,    // single section recall
-  quiz:    8000,    // quiz generation
+  merged:  10000,
+  section: 2000,
+  quiz:    8000,
 } as const;
 
 // ============ REQUEST BUILDERS ============
@@ -747,14 +817,14 @@ ${sectionContent.substring(0, INPUT_LIMITS.section)}
 }
 
 function buildQuizRequest(text: string, questionType: QuizQuestionType, numQuestions: number) {
-  const typeMap: Record<string, string> = {
-    mixed:         'Mix of mcq, true-false, short-answer',
-    mcq:           'Only mcq',
-    'true-false':  'Only true-false',
-    'short-answer':'Only short-answer'
-  };
-
   const safeNum = Math.min(Math.max(numQuestions, 1), 10);
+
+  const typeInstructions: Record<string, string> = {
+    mcq:            `All ${safeNum} questions MUST be "mcq". Each MUST have "options" with EXACTLY 4 strings. correctAnswer must match one option exactly.`,
+    'true-false':   `All ${safeNum} questions MUST be "true-false". Each MUST have "options": ["True", "False"]. correctAnswer must be "True" or "False".`,
+    'short-answer': `All ${safeNum} questions MUST be "short-answer". Each MUST have "options": [] (empty array). correctAnswer is 1-3 words.`,
+    mixed:          `Mix of "mcq", "true-false", and "short-answer". EVERY question MUST have the "options" field. MCQ: exactly 4 option strings. True-false: ["True", "False"]. Short-answer: [] (empty array).`
+  };
 
   return {
     systemInstruction: {
@@ -762,7 +832,12 @@ function buildQuizRequest(text: string, questionType: QuizQuestionType, numQuest
     },
     contents: [{
       parts: [{
-        text: `${safeNum} questions. ${typeMap[questionType] || typeMap.mixed}. Explanations: 1 sentence.
+        text: `Create exactly ${safeNum} questions.
+
+${typeInstructions[questionType] || typeInstructions.mixed}
+
+IMPORTANT: Every question object MUST include the "options" field.
+Explanations: 1 sentence max.
 
 Content:
 """
@@ -778,6 +853,135 @@ ${text.substring(0, INPUT_LIMITS.quiz)}
       responseSchema: quizResponseSchema
     }
   };
+}
+
+// ============ QUIZ POST-PROCESSING ============
+
+/**
+ * Validates, repairs, and backfills quiz questions after parsing.
+ *
+ * DESIGN PRINCIPLE: Never silently drop questions. Repair first,
+ * filter only as an absolute last resort (missing question text
+ * or correctAnswer entirely). Logs every repair for debugging.
+ *
+ * @param questions - Raw parsed questions from Gemini
+ * @param requestedCount - How many the user asked for (used to log shortfall)
+ * @returns Repaired and validated questions
+ */
+function validateAndRepairQuiz(
+  questions: QuizQuestion[],
+  requestedCount: number
+): QuizQuestion[] {
+  const repaired = questions.map((q, i) => {
+    const fixed = { ...q, id: i };
+
+    // ── Normalize type field ──
+    if (!fixed.type || !['mcq', 'true-false', 'short-answer'].includes(fixed.type)) {
+      // Infer type from structure
+      if (Array.isArray(fixed.options) && fixed.options.length === 4) {
+        fixed.type = 'mcq' as any;
+      } else if (
+        Array.isArray(fixed.options) &&
+        fixed.options.length === 2 &&
+        fixed.options.some(o => o.toLowerCase() === 'true')
+      ) {
+        fixed.type = 'true-false' as any;
+      } else {
+        fixed.type = 'short-answer' as any;
+      }
+      console.warn(`[quiz-repair] Q${i}: inferred type "${fixed.type}" from structure`);
+    }
+
+    // ── MCQ repairs ──
+    if (fixed.type === 'mcq') {
+      if (!Array.isArray(fixed.options)) {
+        fixed.options = [];
+        console.warn(`[quiz-repair] Q${i}: MCQ missing options — created empty array`);
+      }
+
+      // Ensure correctAnswer is in options
+      if (fixed.options.length > 0 && fixed.correctAnswer && !fixed.options.includes(fixed.correctAnswer)) {
+        // Try case-insensitive match first
+        const caseMatch = fixed.options.findIndex(
+          o => o.toLowerCase().trim() === fixed.correctAnswer.toLowerCase().trim()
+        );
+        if (caseMatch !== -1) {
+          fixed.correctAnswer = fixed.options[caseMatch];
+          console.warn(`[quiz-repair] Q${i}: corrected answer case to match option`);
+        } else {
+          fixed.options[fixed.options.length - 1] = fixed.correctAnswer;
+          console.warn(`[quiz-repair] Q${i}: replaced last option with correctAnswer`);
+        }
+      }
+
+      // Pad to 4 options
+      while (fixed.options.length < 4) {
+        fixed.options.push(`Option ${String.fromCharCode(65 + fixed.options.length)}`);
+        console.warn(`[quiz-repair] Q${i}: padded to ${fixed.options.length} options`);
+      }
+
+      // Trim to 4 options (keep correctAnswer)
+      if (fixed.options.length > 4) {
+        const correctIdx = fixed.options.indexOf(fixed.correctAnswer);
+        const kept = fixed.options.slice(0, 4);
+        if (correctIdx >= 4) {
+          kept[3] = fixed.correctAnswer;
+        }
+        fixed.options = kept;
+      }
+
+      // Final safety: correctAnswer must be in the final options array
+      if (!fixed.options.includes(fixed.correctAnswer)) {
+        fixed.options[3] = fixed.correctAnswer;
+      }
+    }
+
+    // ── True/False repairs ──
+    if (fixed.type === 'true-false') {
+      fixed.options = ['True', 'False'];
+      const lower = (fixed.correctAnswer || '').toLowerCase().trim();
+      fixed.correctAnswer = lower === 'true' || lower === 't' ? 'True' : 'False';
+    }
+
+    // ── Short-answer repairs ──
+    if (fixed.type === 'short-answer') {
+      // Strip any stray options Gemini included
+      fixed.options = [] as any;
+    }
+
+    // ── Ensure explanation exists ──
+    if (!fixed.explanation) {
+      fixed.explanation = 'No explanation provided.';
+    }
+
+    return fixed;
+  });
+
+  // ── Only filter questions missing absolutely critical fields ──
+  const valid = repaired.filter(q => {
+    if (!q.question?.trim()) {
+      console.warn(`[quiz-repair] Dropping Q${q.id}: no question text`);
+      return false;
+    }
+    if (!q.correctAnswer?.trim()) {
+      console.warn(`[quiz-repair] Dropping Q${q.id}: no correctAnswer`);
+      return false;
+    }
+    return true;
+  });
+
+  // Re-index after any drops
+  valid.forEach((q, i) => { q.id = i; });
+
+  // Log shortfall for debugging (but never throw)
+  if (valid.length < requestedCount) {
+    console.warn(
+      `[quiz-repair] Requested ${requestedCount} questions, ` +
+      `got ${valid.length} after validation`
+    );
+  }
+
+  return valid;
 }
 
 // ============ SECTION CONTENT EXTRACTION ============
@@ -821,7 +1025,6 @@ function extractSectionContent(
     }
   }
 
-  // Cap at INPUT_LIMITS.section to keep request small
   return fullText.substring(startIndex, Math.min(endIndex, startIndex + INPUT_LIMITS.section));
 }
 
@@ -887,7 +1090,6 @@ export async function generateSectionRecall(
   const cacheKey     = await buildCacheKey('section', truncatedText, sectionShort);
 
   return deduplicatedRequest<SectionRecall>(cacheKey, () =>
-    // ── Enqueue through the jitter gate so rapid expands don't burst ──
     enqueueSectionRequest(async () => {
       const cached = await getCached<SectionRecall>(cacheKey);
       if (cached) {
@@ -942,7 +1144,8 @@ export async function generateQuiz(
       buildQuizRequest(truncatedText, questionType, safeNum)
     );
 
-    const questions = (response.questions || []).map((q, i) => ({ ...q, id: i }));
+    const questions = validateAndRepairQuiz(response.questions || [], safeNum);
+
     await setCache(cacheKey, questions);
     return questions;
   });
