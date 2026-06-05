@@ -507,7 +507,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
         <>
           <textarea
             className="text-input-area"
-            placeholder="Paste your study material here — lecture notes, textbook passages, articles, or any content you want to learn and retain. The AI will create a simplified summary (Feynman technique) plus comprehensive recall questions..."
+            placeholder="💡 Tip: Content is optimized for up to 10,000 characters. Using clear paragraphs or headers helps the system generate better sub-section deep-dives!"
             value={text}
             onChange={(e) => setText(e.target.value)}
             disabled={loading}

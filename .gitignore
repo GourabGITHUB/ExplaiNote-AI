@@ -15,7 +15,7 @@ vite.config.ts.timestamp-*
 .env
 .env.*
 !.env.example
-
+.dev.vars
 # Logs
 logs
 *.log

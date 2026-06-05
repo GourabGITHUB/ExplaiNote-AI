@@ -7,6 +7,7 @@ import RecallPage from './components/RecallPage';
 import QuizPage from './components/QuizPage';
 import PrivacyPage from './components/PrivacyPage';
 import { getAllProjects, deleteProject, getProject, type Project } from './services/db';
+import TallyFeedbackButton from "./components/FeedBackBtn";
 
 function AppContent() {
   const location = useLocation();
@@ -15,7 +16,7 @@ function AppContent() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [activeProject, setActiveProject] = useState<Project | null>(null);
-
+const showFeedback = location.pathname == "/";
   const loadProjects = useCallback(async () => {
     try {
       const loadedProjects = await getAllProjects();
@@ -88,7 +89,7 @@ function AppContent() {
             <line x1="3" y1="18" x2="21" y2="18"/>
           </svg>
         </button>
-        <span className="mobile-logo">explaiNote AI</span>
+        <span className="mobile-logo">ExplaiNote AI</span>
       </div>
 
       <main className="main-content">
@@ -125,6 +126,10 @@ function AppContent() {
 <Route path="/privacy" element={<PrivacyPage />} />
         </Routes>
       </main>
+      {showFeedback && (
+  <TallyFeedbackButton formId="dWzxAK" />
+)}
+
     </div>
   );
 }

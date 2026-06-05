@@ -8,10 +8,9 @@ import type {
   FlashCard
 } from '../types';
 
-// Gemini 2.5 Flash
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
 
-// ============ RETRY & ERROR HANDLING ============
+// ============ RETRY CONFIG ============
 
 interface RetryConfig {
   maxRetries: number;
@@ -33,67 +32,482 @@ async function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// ============ UPDATED RETRY & ERROR HANDLING ============
+// ============ IN-FLIGHT DEDUPLICATION ============
+
+const inflightRequests = new Map<string, Promise<any>>();
+
+function deduplicatedRequest<T>(key: string, producer: () => Promise<T>): Promise<T> {
+  const existing = inflightRequests.get(key);
+  if (existing) {
+    console.log(`[dedup] Piggy-backing on in-flight request: ${key}`);
+    return existing as Promise<T>;
+  }
+
+  const promise = producer().finally(() => {
+    inflightRequests.delete(key);
+  });
+
+  inflightRequests.set(key, promise);
+  return promise;
+}
+
+// ============ SECTION EXPAND THROTTLE ============
+
+/**
+ * Micro-jitter delay + sequential queue for section recall requests.
+ *
+ * Problem: When a user rapidly clicks 4 section expanders within ~50ms,
+ * each click resolves its await buildCacheKey() at slightly different times,
+ * so they all miss the dedup map and fire 4 parallel API calls → instant
+ * rate-limit on the free tier.
+ *
+ * Solution: A tiny queue that spaces section requests apart by at least
+ * SECTION_JITTER_MS. The first request goes immediately; subsequent ones
+ * wait for the previous to start + jitter.
+ */
+const SECTION_JITTER_MS = 350;
+let sectionQueueTail: Promise<void> = Promise.resolve();
+
+function enqueueSectionRequest<T>(fn: () => Promise<T>): Promise<T> {
+  // Chain onto the tail: wait for previous section to START (not finish),
+  // then add jitter, then run ours.
+  const result = sectionQueueTail.then(async () => {
+    await sleep(SECTION_JITTER_MS);
+    return fn();
+  });
+
+  // Update the tail to track when THIS request's jitter has elapsed
+  // (not when the API call finishes — we don't want to serialize fully)
+  sectionQueueTail = sectionQueueTail
+    .then(() => sleep(SECTION_JITTER_MS))
+    .catch(() => {}); // swallow errors so the queue never jams
+
+  return result;
+}
+
+// ============ SHA-256 HASHING ============
+
+const CACHE_VERSION = 'v1';
+
+function normalizeTextForHashing(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+async function sha256(input: string): Promise<string> {
+  try {
+    const encoder = new TextEncoder();
+    const data    = encoder.encode(input);
+    const buffer  = await crypto.subtle.digest('SHA-256', data);
+    const bytes   = new Uint8Array(buffer);
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    let hash = 5381;
+    for (let i = 0; i < input.length; i++) {
+      hash = ((hash << 5) + hash + input.charCodeAt(i)) >>> 0;
+    }
+    return hash.toString(16);
+  }
+}
+
+async function buildCacheKey(prefix: string, text: string, extra?: string): Promise<string> {
+  const normalized = normalizeTextForHashing(text);
+  const hash       = await sha256(normalized);
+  const short      = hash.substring(0, 16);
+  return extra
+    ? `${prefix}:${CACHE_VERSION}:${short}:${extra}`
+    : `${prefix}:${CACHE_VERSION}:${short}`;
+}
+
+// ============ INDEXEDDB CACHE LAYER ============
+
+const DB_NAME    = 'ExplaiNoteCache';
+const DB_VERSION = 1;
+const STORE_NAME = 'gemini_responses';
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+interface CacheEntry {
+  key: string;
+  data: any;
+  timestamp: number;
+}
+
+function openCacheDB(): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME, { keyPath: 'key' });
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror   = () => reject(request.error);
+  });
+}
+
+async function getCached<T>(key: string): Promise<T | null> {
+  try {
+    const db = await openCacheDB();
+    return new Promise((resolve) => {
+      const tx    = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req   = store.get(key);
+
+      req.onsuccess = () => {
+        const entry = req.result as CacheEntry | undefined;
+        if (!entry) { resolve(null); return; }
+
+        if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+          const delTx = db.transaction(STORE_NAME, 'readwrite');
+          delTx.objectStore(STORE_NAME).delete(key);
+          resolve(null);
+          return;
+        }
+
+        resolve(entry.data as T);
+      };
+
+      req.onerror = () => resolve(null);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function setCache(key: string, data: any): Promise<void> {
+  try {
+    const db = await openCacheDB();
+    return new Promise((resolve) => {
+      const tx    = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      const entry: CacheEntry = { key, data, timestamp: Date.now() };
+      store.put(entry);
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => resolve();
+    });
+  } catch {
+    // Silently ignore
+  }
+}
+
+export async function clearGeminiCache(): Promise<void> {
+  try {
+    const db = await openCacheDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => resolve();
+    });
+  } catch {
+    // Silently ignore
+  }
+}
+
+// ============ JSON REPAIR PIPELINE ============
+
+function stripRogueCharacters(text: string): string {
+  return text
+    .replace(/[\uFEFF\u200B\u200C\u200D\u2060]/g, '')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2013\u2014]/g, '-');
+}
+
+function normalizeLiteralWhitespace(text: string): string {
+  let result = '';
+  let insideString = false;
+  let i = 0;
+
+  while (i < text.length) {
+    const char = text[i];
+
+    if (char === '\\' && insideString && i + 1 < text.length) {
+      result += char + text[i + 1];
+      i += 2;
+      continue;
+    }
+
+    if (char === '"') {
+      insideString = !insideString;
+      result += char;
+      i++;
+      continue;
+    }
+
+    if (insideString) {
+      if (char === '\n') { result += '\\n'; i++; continue; }
+      if (char === '\r') { result += '\\r'; i++; continue; }
+      if (char === '\t') { result += '\\t'; i++; continue; }
+    }
+
+    result += char;
+    i++;
+  }
+
+  return result;
+}
+
+function fixUnescapedQuotes(text: string): string {
+  let result = '';
+  let insideString = false;
+  let i = 0;
+
+  while (i < text.length) {
+    const char = text[i];
+
+    if (char === '\\' && i + 1 < text.length) {
+      result += char + text[i + 1];
+      i += 2;
+      continue;
+    }
+
+    if (char === '"') {
+      if (!insideString) {
+        insideString = true;
+        result += char;
+        i++;
+        continue;
+      }
+
+      const next = peekNextNonWhitespace(text, i + 1);
+      const isClosingQuote =
+        next === ',' ||
+        next === '}' ||
+        next === ']' ||
+        next === '';
+
+      if (isClosingQuote) {
+        insideString = false;
+        result += char;
+      } else {
+        result += '\\"';
+      }
+
+      i++;
+      continue;
+    }
+
+    result += char;
+    i++;
+  }
+
+  return result;
+}
+
+function peekNextNonWhitespace(text: string, fromIndex: number): string {
+  for (let j = fromIndex; j < text.length; j++) {
+    if (!/\s/.test(text[j])) return text[j];
+  }
+  return '';
+}
+
+function removeTrailingCommas(text: string): string {
+  return text.replace(/,(\s*[}\]])/g, '$1');
+}
+
+function extractBalanced(
+  text: string,
+  startIdx: number,
+  openChar: string,
+  closeChar: string
+): string | null {
+  let depth = 0;
+  let insideString = false;
+  let i = startIdx;
+
+  while (i < text.length) {
+    const char = text[i];
+    if (char === '\\' && insideString) { i += 2; continue; }
+    if (char === '"') { insideString = !insideString; i++; continue; }
+    if (!insideString) {
+      if (char === openChar)  depth++;
+      if (char === closeChar) depth--;
+      if (depth === 0) return text.slice(startIdx, i + 1);
+    }
+    i++;
+  }
+
+  return null;
+}
+
+function attemptTruncationRepair(text: string): string {
+  let insideString = false;
+  const stack: string[] = [];
+  let i = 0;
+
+  while (i < text.length) {
+    const char = text[i];
+
+    if (char === '\\' && insideString && i + 1 < text.length) {
+      i += 2;
+      continue;
+    }
+
+    if (char === '"') {
+      insideString = !insideString;
+      i++;
+      continue;
+    }
+
+    if (!insideString) {
+      if (char === '{' || char === '[') stack.push(char);
+      if (char === '}' || char === ']') stack.pop();
+    }
+
+    i++;
+  }
+
+  let repaired = text;
+  if (insideString) repaired += '"';
+  for (let j = stack.length - 1; j >= 0; j--) {
+    repaired += stack[j] === '{' ? '}' : ']';
+  }
+
+  return repaired;
+}
+
+function extractJSON(text: string): string {
+  const cleaned = stripRogueCharacters(text);
+
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenceMatch?.[1]?.trim()) return fenceMatch[1].trim();
+
+  const firstBracket = cleaned.search(/[\[{]/);
+  if (firstBracket !== -1) {
+    const openChar  = cleaned[firstBracket];
+    const closeChar = openChar === '[' ? ']' : '}';
+    const balanced  = extractBalanced(cleaned, firstBracket, openChar, closeChar);
+    if (balanced) return balanced;
+    return cleaned.slice(firstBracket);
+  }
+
+  return cleaned;
+}
+
+function safeParseJSON<T>(text: string): T {
+  const s1 = stripRogueCharacters(text);
+  const s2 = normalizeLiteralWhitespace(s1);
+  const s3 = removeTrailingCommas(s2);
+  const s4 = attemptTruncationRepair(s2);
+  const s5 = fixUnescapedQuotes(s2);
+  const s6 = removeTrailingCommas(s5);
+  const s7 = attemptTruncationRepair(s5);
+  const s8 = removeTrailingCommas(attemptTruncationRepair(fixUnescapedQuotes(s2)));
+
+  const strategies: Array<{ name: string; value: string }> = [
+    { name: 'raw',                                        value: text },
+    { name: 'strip-rogue-chars',                          value: s1   },
+    { name: 'normalize-whitespace',                       value: s2   },
+    { name: 'normalize + remove-trailing-commas',         value: s3   },
+    { name: 'normalize + truncation-repair',              value: s4   },
+    { name: 'normalize + fix-quotes',                     value: s5   },
+    { name: 'normalize + fix-quotes + remove-commas',     value: s6   },
+    { name: 'normalize + fix-quotes + truncation-repair', value: s7   },
+    { name: 'full-pipeline',                              value: s8   },
+  ];
+
+  const errors: string[] = [];
+
+  for (const strategy of strategies) {
+    try {
+      const parsed = JSON.parse(strategy.value);
+      if (strategy.name !== 'raw') {
+        console.warn(`[safeParseJSON] Recovered using strategy: "${strategy.name}"`);
+      }
+      return parsed as T;
+    } catch (err: any) {
+      errors.push(`  • [${strategy.name}]: ${err.message}`);
+    }
+  }
+
+  throw new Error(
+    `[safeParseJSON] All strategies failed.\n` +
+    `Attempted:\n${errors.join('\n')}\n` +
+    `Input (first 500 chars):\n${text.slice(0, 500)}`
+  );
+}
+
+// ============ GEMINI FETCH WITH RETRY ============
 
 async function callGeminiWithRetry<T>(
-  userApiKey: string, // Changed from general apiKey to explicit userApiKey
+  userApiKey: string,
   requestBody: object,
   config: RetryConfig = DEFAULT_RETRY_CONFIG
 ): Promise<T> {
   let lastError: Error | null = null;
-  
+
   const trimmedUserKey = userApiKey.trim();
-  
-  // Decide target URL: Use direct Google URL if user provided a key, otherwise use our proxy
-  const targetUrl = trimmedUserKey 
-    ? `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${trimmedUserKey}`
+  const targetUrl = trimmedUserKey
+    ? `${GEMINI_API_URL}?key=${trimmedUserKey}`
     : `/api/proxy`;
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
       const response = await fetch(targetUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json',
-        'X-App-Client': 'ExplaiNote-SPA-Client' }, //custom identifier
-        body: JSON.stringify(requestBody), // The proxy receives this exact format
+        headers: {
+          'Content-Type': 'application/json',
+          'X-App-Client': 'ExplaiNote-SPA-Client',
+        },
+        body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
+        const errData    = await response.json().catch(() => ({}));
         const errMessage = errData?.error?.message || `API error: ${response.status}`;
-        
+
         if (isRetryableError(response.status) && attempt < config.maxRetries) {
           const delay = Math.min(
             config.baseDelayMs * Math.pow(2, attempt) + Math.random() * 500,
             config.maxDelayMs
           );
-          console.log(`Rate limited (${response.status}). Retrying... (attempt ${attempt + 1}/${config.maxRetries})`);
+          console.warn(
+            `[callGeminiWithRetry] HTTP ${response.status} — ` +
+            `retrying attempt ${attempt + 1}/${config.maxRetries} in ${Math.round(delay)}ms…`
+          );
           await sleep(delay);
           continue;
         }
-        
+
         throw new Error(errMessage);
       }
 
-      const data = await response.json();
-      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-      
-      if (!text) {
+      const data    = await response.json();
+      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
+
+      if (!rawText) {
+        const finishReason = data?.candidates?.[0]?.finishReason;
+        if (finishReason === 'MAX_TOKENS') {
+          throw new Error('Response cut off — token limit exceeded. Try shorter content.');
+        }
         throw new Error('No response content from AI');
       }
 
-      const jsonStr = extractJSON(text);
-      return JSON.parse(jsonStr) as T;
-      
+      const finishReason = data?.candidates?.[0]?.finishReason;
+      if (finishReason === 'MAX_TOKENS') {
+        console.warn('[callGeminiWithRetry] Response hit MAX_TOKENS — attempting repair…');
+      }
+
+      const jsonStr = extractJSON(rawText);
+      return safeParseJSON<T>(jsonStr);
+
     } catch (err: any) {
       lastError = err;
-      
-      if (attempt < config.maxRetries && (err.name === 'TypeError' || err.message.includes('JSON'))) {
+
+      if (attempt < config.maxRetries && err.name === 'TypeError') {
         const delay = config.baseDelayMs * Math.pow(2, attempt);
+        console.warn(
+          `[callGeminiWithRetry] Network error — ` +
+          `retrying attempt ${attempt + 1}/${config.maxRetries}…`
+        );
         await sleep(delay);
         continue;
       }
-      
+
       throw err;
     }
   }
@@ -101,24 +515,13 @@ async function callGeminiWithRetry<T>(
   throw lastError || new Error('Max retries exceeded');
 }
 
-function extractJSON(text: string): string {
-  const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (codeBlockMatch) return codeBlockMatch[1].trim();
-
-  const jsonMatch = text.match(/[\[{][\s\S]*[\]}]/);
-  if (jsonMatch) return jsonMatch[0];
-
-  return text;
-}
-
 // ============ SCHEMA DEFINITIONS ============
 
-// Difficulty is now REQUIRED to prevent TypeScript issues
 const flashCardSchema = {
   type: "OBJECT",
   properties: {
-    question: { type: "STRING" },
-    answer: { type: "STRING" },
+    question:   { type: "STRING" },
+    answer:     { type: "STRING" },
     difficulty: { type: "STRING", enum: ["basic", "intermediate", "advanced"] }
   },
   required: ["question", "answer", "difficulty"]
@@ -127,7 +530,7 @@ const flashCardSchema = {
 const keyConceptSchema = {
   type: "OBJECT",
   properties: {
-    term: { type: "STRING" },
+    term:        { type: "STRING" },
     explanation: { type: "STRING" }
   },
   required: ["term", "explanation"]
@@ -136,75 +539,62 @@ const keyConceptSchema = {
 const simplifiedSectionSchema = {
   type: "OBJECT",
   properties: {
-    heading: { type: "STRING" },
+    heading:           { type: "STRING" },
     simpleExplanation: { type: "STRING" },
-    keyPoints: { type: "ARRAY", items: { type: "STRING" } },
-    analogy: { type: "STRING" },
-    commonMisconceptions: { type: "ARRAY", items: { type: "STRING" } },
-    realWorldExample: { type: "STRING" }
+    keyPoints:         { type: "ARRAY", items: { type: "STRING" } },
+    analogy:           { type: "STRING" },
+    realWorldExample:  { type: "STRING" }
   },
   required: ["heading", "simpleExplanation", "keyPoints"]
 };
 
-// Schema for Call 1: Simplified Summary
-const simplifiedSummaryResponseSchema = {
+const mergedSummaryBigPictureSchema = {
   type: "OBJECT",
   properties: {
-    documentOverview: { type: "STRING" },
+    documentOverview:  { type: "STRING" },
     documentStructure: { type: "ARRAY", items: { type: "STRING" } },
     simplifiedSummary: {
       type: "OBJECT",
       properties: {
-        title: { type: "STRING" },
+        title:           { type: "STRING" },
         oneLinerSummary: { type: "STRING" },
-        whyItMatters: { type: "STRING" },
-        coreIdea: { type: "STRING" },
-        sections: { type: "ARRAY", items: simplifiedSectionSchema },
-        keyTakeaways: { type: "ARRAY", items: { type: "STRING" } },
-        quickRecap: { type: "STRING" },
-        glossary: { type: "ARRAY", items: keyConceptSchema }
+        whyItMatters:    { type: "STRING" },
+        coreIdea:        { type: "STRING" },
+        sections:        { type: "ARRAY", items: simplifiedSectionSchema },
+        keyTakeaways:    { type: "ARRAY", items: { type: "STRING" } },
+        quickRecap:      { type: "STRING" },
+        glossary:        { type: "ARRAY", items: keyConceptSchema }
       },
       required: ["title", "oneLinerSummary", "whyItMatters", "coreIdea", "sections", "keyTakeaways", "quickRecap"]
-    }
-  },
-  required: ["documentOverview", "documentStructure", "simplifiedSummary"]
-};
-
-// Schema for Big Picture Recall (separate call)
-const bigPictureRecallSchema = {
-  type: "OBJECT",
-  properties: {
-    mainIdeas: { type: "ARRAY", items: flashCardSchema },
-    coreThemes: { type: "ARRAY", items: flashCardSchema },
-    purposeAndStructure: { type: "ARRAY", items: flashCardSchema },
-    sectionRelationships: { type: "ARRAY", items: flashCardSchema },
-    summaryQuestions: { type: "ARRAY", items: flashCardSchema }
-  },
-  required: ["mainIdeas", "coreThemes", "purposeAndStructure"]
-};
-
-const bigPictureResponseSchema = {
-  type: "OBJECT",
-  properties: {
-    bigPictureRecall: bigPictureRecallSchema,
+    },
+    bigPictureRecall: {
+      type: "OBJECT",
+      properties: {
+        mainIdeas:            { type: "ARRAY", items: flashCardSchema },
+        coreThemes:           { type: "ARRAY", items: flashCardSchema },
+        purposeAndStructure:  { type: "ARRAY", items: flashCardSchema },
+        sectionRelationships: { type: "ARRAY", items: flashCardSchema },
+        summaryQuestions:     { type: "ARRAY", items: flashCardSchema }
+      },
+      required: ["mainIdeas", "coreThemes", "purposeAndStructure"]
+    },
     crossSectionConnections: { type: "ARRAY", items: flashCardSchema },
-    finalReviewQuestions: { type: "ARRAY", items: flashCardSchema }
+    finalReviewQuestions:    { type: "ARRAY", items: flashCardSchema }
   },
-  required: ["bigPictureRecall"]
+  required: ["documentOverview", "documentStructure", "simplifiedSummary", "bigPictureRecall"]
 };
 
-// Schema for Single Section Recall (per-section call)
 const singleSectionRecallSchema = {
   type: "OBJECT",
   properties: {
-    sectionTitle: { type: "STRING" },
-    sectionSummary: { type: "STRING" },
-    concepts: { type: "ARRAY", items: keyConceptSchema },
-    definitions: { type: "ARRAY", items: flashCardSchema },
-    processes: { type: "ARRAY", items: flashCardSchema },
-    examples: { type: "ARRAY", items: flashCardSchema },
-    comparisons: { type: "ARRAY", items: flashCardSchema },
-    applications: { type: "ARRAY", items: flashCardSchema },
+    sectionTitle:     { type: "STRING" },
+    sectionSummary:   { type: "STRING" },
+    concepts:         { type: "ARRAY", items: keyConceptSchema },
+    definitions:      { type: "ARRAY", items: flashCardSchema },
+    processes:        { type: "ARRAY", items: flashCardSchema },
+    examples:         { type: "ARRAY", items: flashCardSchema },
+    comparisons:      { type: "ARRAY", items: flashCardSchema },
+    applications:     { type: "ARRAY", items: flashCardSchema },
     criticalThinking: { type: "ARRAY", items: flashCardSchema }
   },
   required: ["sectionTitle", "sectionSummary"]
@@ -218,17 +608,16 @@ const sectionRecallResponseSchema = {
   required: ["sectionRecall"]
 };
 
-// Quiz schema
 const quizQuestionSchema = {
   type: "OBJECT",
   properties: {
-    id: { type: "INTEGER" },
-    type: { type: "STRING", enum: ["mcq", "true-false", "short-answer"] },
-    question: { type: "STRING" },
-    options: { type: "ARRAY", items: { type: "STRING" } },
+    id:            { type: "INTEGER" },
+    type:          { type: "STRING", enum: ["mcq", "true-false", "short-answer"] },
+    question:      { type: "STRING" },
+    options:       { type: "ARRAY", items: { type: "STRING" } },
     correctAnswer: { type: "STRING" },
-    explanation: { type: "STRING" },
-    section: { type: "STRING" }
+    explanation:   { type: "STRING" },
+    section:       { type: "STRING" }
   },
   required: ["id", "type", "question", "correctAnswer", "explanation"]
 };
@@ -243,61 +632,44 @@ const quizResponseSchema = {
 
 // ============ SYSTEM INSTRUCTIONS ============
 
-const FEYNMAN_SYSTEM_INSTRUCTION = `You are an expert educational content designer specializing in the Feynman technique.
+// Shorter system prompts → fewer input tokens per request
 
-CORE PRINCIPLES:
-- Explain complex concepts as if teaching a 12-year-old
-- Use simple, everyday language — avoid jargon
-- Include relatable analogies and real-world examples
-- Break down information into clear, logical sections
-- Highlight what's truly important
+const MERGED_SYSTEM_INSTRUCTION = `You are an expert educational content designer.
 
-WRITING STYLE:
-- Use phrases like "Think of it like...", "Imagine..."
-- Replace jargon: "utilize" → "use"
-- Use concrete examples everyone can relate to
-- Always explain WHY something matters
+SUMMARY (Feynman technique): Explain as if teaching a 12-year-old. Use simple language, analogies, examples. Keep every field to 1-2 sentences max.
 
-OUTPUT: Respond with valid JSON matching the schema exactly. Keep responses concise.`;
+RECALL QUESTIONS: Cover main ideas, themes, structure. Each question needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence.
 
-const ACTIVE_RECALL_SYSTEM_INSTRUCTION = `You are an expert in creating active recall study materials.
+CRITICAL: Be extremely concise. Valid JSON only.`;
 
-CORE PRINCIPLES:
-- Create layered questions: basic, intermediate, advanced
-- Cover definitions, processes, examples, comparisons, applications
-- Questions should test understanding, not just memorization
-- Keep answers concise but complete
+const SECTION_RECALL_SYSTEM_INSTRUCTION = `You are an active recall expert. Create focused recall questions for one section. Each needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence. Skip empty categories. Valid JSON only.`;
 
-DIFFICULTY LEVELS (always specify one):
-- "basic": Direct recall of facts and definitions
-- "intermediate": Understanding relationships and processes  
-- "advanced": Application and critical thinking
+const QUIZ_SYSTEM_INSTRUCTION = `You are a quiz generator. Rules: mcq=4 options, true-false=["True","False"], short-answer=no options+1-3 word answer. Explanations: 1 sentence. Valid JSON only.`;
 
-OUTPUT: Respond with valid JSON matching the schema exactly. Be concise.`;
+// ============ INPUT BUDGET CONSTANTS ============
 
-const QUIZ_SYSTEM_INSTRUCTION = `You are an expert quiz generator for educational content.
-
-RULES:
-- For "mcq": exactly 4 options, correctAnswer matches one option exactly
-- For "true-false": options are ["True", "False"]
-- For "short-answer": no options, correctAnswer is 1-3 words
-- Progress from foundational to advanced concepts
-- Explanations should be educational
-
-OUTPUT: Respond with valid JSON matching the schema exactly.`;
+/**
+ * Maximum characters sent to Gemini per request type.
+ *
+ * Free-tier Gemini 2.5 Flash: 1M token context, but output is capped at
+ * ~8192 tokens. Our real bottleneck is OUTPUT tokens + rate limits.
+ * Smaller inputs = faster responses + less chance of truncation.
+ */
+const INPUT_LIMITS = {
+  merged:  10000,   // summary + big picture
+  section: 2000,    // single section recall
+  quiz:    8000,    // quiz generation
+} as const;
 
 // ============ REQUEST BUILDERS ============
 
-interface SimplifiedSummaryResponse {
-  documentOverview: string;
-  documentStructure: string[];
-  simplifiedSummary: SimplifiedSummary;
-}
-
-interface BigPictureResponse {
-  bigPictureRecall: BigPictureRecall;
+interface MergedResponse {
+  documentOverview:         string;
+  documentStructure:        string[];
+  simplifiedSummary:        SimplifiedSummary;
+  bigPictureRecall:         BigPictureRecall;
   crossSectionConnections?: FlashCard[];
-  finalReviewQuestions?: FlashCard[];
+  finalReviewQuestions?:    FlashCard[];
 }
 
 interface SectionRecallResponse {
@@ -308,75 +680,39 @@ interface QuizResponse {
   questions: QuizQuestion[];
 }
 
-function buildSimplifiedSummaryRequest(text: string) {
+function buildMergedSummaryBigPictureRequest(text: string) {
   return {
     systemInstruction: {
-      parts: [{ text: FEYNMAN_SYSTEM_INSTRUCTION }]
+      parts: [{ text: MERGED_SYSTEM_INSTRUCTION }]
     },
     contents: [{
       parts: [{
-        text: `Analyze this content and create a simplified summary using the Feynman technique.
+        text: `Analyze and produce BOTH a simplified summary AND big-picture recall in one JSON.
 
-REQUIREMENTS:
-- Identify the main sections/topics in the document (list them in documentStructure)
-- Create a clear title and one-liner summary
-- Explain why this topic matters
-- For each section: simple explanation, 3 key points, an analogy, real-world example
-- Include 3-5 key takeaways and a quick recap
-- Create a glossary of technical terms (maximum 8 terms)
+SUMMARY:
+- documentStructure: 3-4 section titles
+- title, oneLinerSummary: 1 sentence each
+- whyItMatters, coreIdea: 1 sentence each
+- sections: MAX 3, each: simpleExplanation(1 sentence), 3 keyPoints(1 sentence each), analogy(1 sentence), realWorldExample(1 sentence)
+- keyTakeaways: MAX 3 (1 sentence each)
+- quickRecap: 1 sentence
+- glossary: MAX 3 terms
 
-Keep the simplified summary sections to a MAXIMUM of 5 sections.
+RECALL (9 questions total, 1 sentence answers):
+- mainIdeas:2, coreThemes:2, purposeAndStructure:1, sectionRelationships:1, summaryQuestions:1, crossSectionConnections:1, finalReviewQuestions:1
 
 CONTENT:
 """
-${text}
+${text.substring(0, INPUT_LIMITS.merged)}
 """`
       }]
     }],
     generationConfig: {
-      temperature: 0.7,
+      temperature: 0.4,
+      topP: 0.9,
       maxOutputTokens: 3500,
       responseMimeType: "application/json",
-      responseSchema: simplifiedSummaryResponseSchema
-    }
-  };
-}
-
-function buildBigPictureRecallRequest(text: string, documentStructure: string[]) {
-  const structureList = documentStructure.slice(0, 5).join(', ');
-  
-  return {
-    systemInstruction: {
-      parts: [{ text: ACTIVE_RECALL_SYSTEM_INSTRUCTION }]
-    },
-    contents: [{
-      parts: [{
-        text: `Create big-picture recall questions for this content.
-
-Document sections: ${structureList}
-
-REQUIREMENTS (strict limits):
-- mainIdeas: 2 questions about the central thesis
-- coreThemes: 2 questions about recurring themes
-- purposeAndStructure: 1-2 questions about the author's purpose
-- sectionRelationships: 2 questions linking different sections
-- summaryQuestions: 1 comprehensive question
-- crossSectionConnections: 2 questions connecting concepts across sections
-- finalReviewQuestions: 2 comprehensive review questions
-
-TOTAL: Maximum 14 questions. Each must have difficulty: "basic", "intermediate", or "advanced".
-
-CONTENT SUMMARY:
-"""
-${text.substring(0, 8000)}
-"""`
-      }]
-    }],
-    generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 2500,
-      responseMimeType: "application/json",
-      responseSchema: bigPictureResponseSchema
+      responseSchema: mergedSummaryBigPictureSchema
     }
   };
 }
@@ -384,36 +720,26 @@ ${text.substring(0, 8000)}
 function buildSectionRecallRequest(sectionTitle: string, sectionContent: string) {
   return {
     systemInstruction: {
-      parts: [{ text: ACTIVE_RECALL_SYSTEM_INSTRUCTION }]
+      parts: [{ text: SECTION_RECALL_SYSTEM_INSTRUCTION }]
     },
     contents: [{
       parts: [{
-        text: `Create recall questions for this specific section.
+        text: `Section: "${sectionTitle}"
 
-SECTION: "${sectionTitle}"
+Limits (1 sentence answers, skip N/A):
+- sectionSummary:1 sentence, concepts:max 2, definitions:max 1, processes:max 1, examples:max 1, comparisons:max 1, applications:max 1, criticalThinking:max 1
+Total: max 7 questions.
 
-REQUIREMENTS (strict limits - generate ONLY what's relevant):
-- sectionSummary: 1-2 sentence summary
-- concepts: Maximum 2 key concepts with explanations
-- definitions: Maximum 2 definition questions (basic difficulty)
-- processes: Maximum 1 process question if applicable (intermediate)
-- examples: Maximum 1 example question if applicable (basic/intermediate)
-- comparisons: Maximum 1 comparison if applicable (intermediate)
-- applications: Maximum 1 application question (advanced)
-- criticalThinking: Maximum 1 critical thinking question (advanced)
-
-TOTAL: Maximum 10 questions per section. Each must have difficulty field.
-Skip categories that don't apply to this section.
-
-SECTION CONTENT:
+Content:
 """
-${sectionContent.substring(0, 4000)}
+${sectionContent.substring(0, INPUT_LIMITS.section)}
 """`
       }]
     }],
     generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 1800,
+      temperature: 0.4,
+      topP: 0.9,
+      maxOutputTokens: 800,
       responseMimeType: "application/json",
       responseSchema: sectionRecallResponseSchema
     }
@@ -421,12 +747,14 @@ ${sectionContent.substring(0, 4000)}
 }
 
 function buildQuizRequest(text: string, questionType: QuizQuestionType, numQuestions: number) {
-  const typeInstruction = questionType === 'mixed'
-    ? 'Use a mix of "mcq", "true-false", and "short-answer" types'
-    : `Use only "${questionType}" type questions`;
+  const typeMap: Record<string, string> = {
+    mixed:         'Mix of mcq, true-false, short-answer',
+    mcq:           'Only mcq',
+    'true-false':  'Only true-false',
+    'short-answer':'Only short-answer'
+  };
 
-  // Cap at reasonable limit
-  const safeNumQuestions = Math.min(numQuestions, 15);
+  const safeNum = Math.min(Math.max(numQuestions, 1), 10);
 
   return {
     systemInstruction: {
@@ -434,22 +762,18 @@ function buildQuizRequest(text: string, questionType: QuizQuestionType, numQuest
     },
     contents: [{
       parts: [{
-        text: `Create a quiz with exactly ${safeNumQuestions} questions.
+        text: `${safeNum} questions. ${typeMap[questionType] || typeMap.mixed}. Explanations: 1 sentence.
 
-${typeInstruction}
-
-Cover the material from foundational to advanced concepts.
-Each question tests a different aspect.
-
-CONTENT:
+Content:
 """
-${text.substring(0, 20000)}
+${text.substring(0, INPUT_LIMITS.quiz)}
 """`
       }]
     }],
     generationConfig: {
-      temperature: 0.7,
-      maxOutputTokens: 2500,
+      temperature: 0.4,
+      topP: 0.9,
+      maxOutputTokens: 1200,
       responseMimeType: "application/json",
       responseSchema: quizResponseSchema
     }
@@ -458,231 +782,236 @@ ${text.substring(0, 20000)}
 
 // ============ SECTION CONTENT EXTRACTION ============
 
-function extractSectionContent(fullText: string, sectionTitle: string, allSections: string[]): string {
-  const lowerText = fullText.toLowerCase();
+function extractSectionContent(
+  fullText: string,
+  sectionTitle: string,
+  allSections: string[]
+): string {
+  const lowerText  = fullText.toLowerCase();
   const lowerTitle = sectionTitle.toLowerCase();
-  
-  // Try to find the section in the text
+
   let startIndex = lowerText.indexOf(lowerTitle);
+
   if (startIndex === -1) {
-    // Try partial match
     const words = lowerTitle.split(' ').filter(w => w.length > 3);
     for (const word of words) {
       const idx = lowerText.indexOf(word);
-      if (idx !== -1) {
-        startIndex = idx;
-        break;
-      }
+      if (idx !== -1) { startIndex = idx; break; }
     }
   }
-  
+
   if (startIndex === -1) {
-    // Return a chunk of the full text as fallback
     const sectionIndex = allSections.indexOf(sectionTitle);
-    const chunkSize = Math.floor(fullText.length / Math.max(allSections.length, 1));
-    return fullText.substring(sectionIndex * chunkSize, (sectionIndex + 1) * chunkSize + 500);
+    const chunkSize    = Math.floor(fullText.length / Math.max(allSections.length, 1));
+    return fullText.substring(
+      sectionIndex * chunkSize,
+      (sectionIndex + 1) * chunkSize + 300
+    );
   }
 
-  // Find the next section start or end of document
   let endIndex = fullText.length;
   const currentSectionIndex = allSections.indexOf(sectionTitle);
-  
+
   for (let i = currentSectionIndex + 1; i < allSections.length; i++) {
     const nextSection = allSections[i].toLowerCase();
-    const nextIdx = lowerText.indexOf(nextSection, startIndex + lowerTitle.length);
+    const nextIdx     = lowerText.indexOf(nextSection, startIndex + lowerTitle.length);
     if (nextIdx !== -1 && nextIdx < endIndex) {
       endIndex = nextIdx;
       break;
     }
   }
 
-  return fullText.substring(startIndex, Math.min(endIndex, startIndex + 5000));
+  // Cap at INPUT_LIMITS.section to keep request small
+  return fullText.substring(startIndex, Math.min(endIndex, startIndex + INPUT_LIMITS.section));
 }
 
 // ============ MAIN EXPORT FUNCTIONS ============
 
 export async function generateRecallContent(apiKey: string, text: string): Promise<RecallResult> {
-  // Truncate text if too long
-  const maxChars = 40000;
-  const truncatedText = text.length > maxChars 
+  const maxChars      = 25000;
+  const truncatedText = text.length > maxChars
     ? text.substring(0, maxChars) + '\n\n[Content truncated...]'
     : text;
 
-  // === CALL 1: Generate simplified summary ===
-  console.log('Call 1: Generating simplified summary...');
-  let summaryResponse: SimplifiedSummaryResponse;
-  
-  try {
-    summaryResponse = await callGeminiWithRetry<SimplifiedSummaryResponse>(
-      apiKey,
-      buildSimplifiedSummaryRequest(truncatedText)
-    );
-  } catch (err: any) {
-    console.error('Call 1 failed:', err.message);
-    throw new Error(`Failed to generate summary: ${err.message}`);
-  }
+  const cacheKey = await buildCacheKey('recall-core', truncatedText);
 
-  const documentStructure = summaryResponse.documentStructure || [];
-  const sectionsToProcess = documentStructure.slice(0, 4); // Limit to 4 sections max
-
-  // === CALL 2: Generate big picture recall ===
-  console.log('Call 2: Generating big picture recall...');
-  let bigPictureResponse: BigPictureResponse;
-  
-  try {
-    bigPictureResponse = await callGeminiWithRetry<BigPictureResponse>(
-      apiKey,
-      buildBigPictureRecallRequest(truncatedText, sectionsToProcess)
-    );
-  } catch (err: any) {
-    console.error('Call 2 failed:', err.message);
-    // Return partial result with just summary
-    return createPartialResult(summaryResponse);
-  }
-
-  // === CALLS 3+: Generate section-by-section recall ===
-  const sectionRecalls: SectionRecall[] = [];
-  
-  for (let i = 0; i < sectionsToProcess.length; i++) {
-    const sectionTitle = sectionsToProcess[i];
-    console.log(`Call ${3 + i}: Generating recall for section "${sectionTitle}"...`);
-    
-    // Add delay between section calls to avoid rate limiting
-    if (i > 0) {
-      await sleep(1000);
+  return deduplicatedRequest<RecallResult>(cacheKey, async () => {
+    const cached = await getCached<RecallResult>(cacheKey);
+    if (cached) {
+      console.log('[generateRecallContent] Cache hit — skipping API call');
+      return cached;
     }
-    
+
+    console.log('Generating summary + big picture recall (merged call)…');
+    let merged: MergedResponse;
+
     try {
-      const sectionContent = extractSectionContent(truncatedText, sectionTitle, sectionsToProcess);
-      const sectionResponse = await callGeminiWithRetry<SectionRecallResponse>(
+      merged = await callGeminiWithRetry<MergedResponse>(
         apiKey,
-        buildSectionRecallRequest(sectionTitle, sectionContent)
+        buildMergedSummaryBigPictureRequest(truncatedText)
       );
-      
-      if (sectionResponse.sectionRecall) {
-        sectionRecalls.push(sectionResponse.sectionRecall);
-      }
     } catch (err: any) {
-      console.warn(`Section "${sectionTitle}" failed:`, err.message);
-      // Continue with other sections even if one fails
-      sectionRecalls.push({
-        sectionTitle,
-        sectionSummary: 'Unable to generate recall for this section.',
-        concepts: [],
-        definitions: [],
-        processes: [],
-        examples: [],
-        comparisons: [],
-        applications: [],
-        criticalThinking: []
-      });
+      console.error('Merged call failed:', err.message);
+      throw new Error(`Failed to generate content: ${err.message}`);
     }
-  }
 
-  // === Combine all results ===
-  const result: RecallResult = {
-    documentOverview: summaryResponse.documentOverview,
-    documentStructure: documentStructure,
-    simplifiedSummary: summaryResponse.simplifiedSummary,
-    bigPictureRecall: bigPictureResponse.bigPictureRecall || createEmptyBigPictureRecall(),
-    sectionRecalls: sectionRecalls,
-    crossSectionConnections: bigPictureResponse.crossSectionConnections || [],
-    finalReviewQuestions: bigPictureResponse.finalReviewQuestions || [],
-    totalCoverage: calculateCoverage(sectionRecalls, bigPictureResponse, summaryResponse.simplifiedSummary)
-  };
+    const result: RecallResult = {
+      documentOverview:        merged.documentOverview,
+      documentStructure:       merged.documentStructure || [],
+      simplifiedSummary:       merged.simplifiedSummary,
+      bigPictureRecall:        merged.bigPictureRecall || createEmptyBigPictureRecall(),
+      sectionRecalls:          [],
+      crossSectionConnections: merged.crossSectionConnections || [],
+      finalReviewQuestions:    merged.finalReviewQuestions    || [],
+      totalCoverage:           calculateCoverage([], merged)
+    };
 
-  return result;
+    await setCache(cacheKey, result);
+    return result;
+  });
+}
+
+export async function generateSectionRecall(
+  apiKey: string,
+  fullText: string,
+  sectionTitle: string,
+  allSections: string[]
+): Promise<SectionRecall> {
+  const maxChars      = 25000;
+  const truncatedText = fullText.length > maxChars
+    ? fullText.substring(0, maxChars)
+    : fullText;
+
+  const sectionHash  = await sha256(normalizeTextForHashing(sectionTitle));
+  const sectionShort = sectionHash.substring(0, 12);
+  const cacheKey     = await buildCacheKey('section', truncatedText, sectionShort);
+
+  return deduplicatedRequest<SectionRecall>(cacheKey, () =>
+    // ── Enqueue through the jitter gate so rapid expands don't burst ──
+    enqueueSectionRequest(async () => {
+      const cached = await getCached<SectionRecall>(cacheKey);
+      if (cached) {
+        console.log(`[generateSectionRecall] Cache hit for "${sectionTitle}"`);
+        return cached;
+      }
+
+      console.log(`Generating recall for section "${sectionTitle}"…`);
+
+      try {
+        const sectionContent  = extractSectionContent(truncatedText, sectionTitle, allSections);
+        const response        = await callGeminiWithRetry<SectionRecallResponse>(
+          apiKey,
+          buildSectionRecallRequest(sectionTitle, sectionContent)
+        );
+
+        const sectionRecall = response.sectionRecall || createEmptySectionRecall(sectionTitle);
+        await setCache(cacheKey, sectionRecall);
+        return sectionRecall;
+
+      } catch (err: any) {
+        console.warn(`Section "${sectionTitle}" failed:`, err.message);
+        return createEmptySectionRecall(sectionTitle);
+      }
+    })
+  );
 }
 
 export async function generateQuiz(
   apiKey: string,
   text: string,
   questionType: QuizQuestionType,
-  numQuestions: number = 10
+  numQuestions: number = 5
 ): Promise<QuizQuestion[]> {
-  const maxChars = 40000;
-  const truncatedText = text.length > maxChars 
+  const safeNum       = Math.min(Math.max(numQuestions, 1), 10);
+  const maxChars      = 25000;
+  const truncatedText = text.length > maxChars
     ? text.substring(0, maxChars) + '\n\n[Content truncated...]'
     : text;
 
-  const response = await callGeminiWithRetry<QuizResponse>(
-    apiKey,
-    buildQuizRequest(truncatedText, questionType, numQuestions)
-  );
+  const cacheKey = await buildCacheKey('quiz', truncatedText, `${questionType}:${safeNum}`);
 
-  return (response.questions || []).map((q, i) => ({ ...q, id: i }));
+  return deduplicatedRequest<QuizQuestion[]>(cacheKey, async () => {
+    const cached = await getCached<QuizQuestion[]>(cacheKey);
+    if (cached) {
+      console.log('[generateQuiz] Cache hit — skipping API call');
+      return cached;
+    }
+
+    const response = await callGeminiWithRetry<QuizResponse>(
+      apiKey,
+      buildQuizRequest(truncatedText, questionType, safeNum)
+    );
+
+    const questions = (response.questions || []).map((q, i) => ({ ...q, id: i }));
+    await setCache(cacheKey, questions);
+    return questions;
+  });
 }
 
 // ============ HELPER FUNCTIONS ============
 
 function createEmptyBigPictureRecall(): BigPictureRecall {
   return {
-    mainIdeas: [],
-    coreThemes: [],
-    purposeAndStructure: [],
+    mainIdeas:            [],
+    coreThemes:           [],
+    purposeAndStructure:  [],
     sectionRelationships: [],
-    summaryQuestions: []
+    summaryQuestions:     []
   };
 }
 
-function createPartialResult(summaryResponse: SimplifiedSummaryResponse): RecallResult {
+function createEmptySectionRecall(sectionTitle: string): SectionRecall {
   return {
-    documentOverview: summaryResponse.documentOverview,
-    documentStructure: summaryResponse.documentStructure || [],
-    simplifiedSummary: summaryResponse.simplifiedSummary,
-    bigPictureRecall: createEmptyBigPictureRecall(),
-    sectionRecalls: [],
-    crossSectionConnections: [],
-    finalReviewQuestions: [],
-    totalCoverage: {
-      sectionsIdentified: summaryResponse.simplifiedSummary?.sections?.length || 0,
-      questionsGenerated: 0,
-      conceptsCovered: summaryResponse.simplifiedSummary?.glossary?.length || 0
-    }
+    sectionTitle,
+    sectionSummary:   'Unable to generate recall for this section.',
+    concepts:         [],
+    definitions:      [],
+    processes:        [],
+    examples:         [],
+    comparisons:      [],
+    applications:     [],
+    criticalThinking: []
   };
 }
 
 function calculateCoverage(
   sectionRecalls: SectionRecall[],
-  bigPictureResponse: BigPictureResponse,
-  summary: SimplifiedSummary
+  merged: MergedResponse
 ): { sectionsIdentified: number; questionsGenerated: number; conceptsCovered: number } {
   let totalQuestions = 0;
-  let totalConcepts = 0;
+  let totalConcepts  = 0;
 
-  // Count big picture questions
-  const bp = bigPictureResponse.bigPictureRecall;
+  const bp = merged.bigPictureRecall;
   if (bp) {
-    totalQuestions += (bp.mainIdeas?.length || 0);
-    totalQuestions += (bp.coreThemes?.length || 0);
-    totalQuestions += (bp.purposeAndStructure?.length || 0);
-    totalQuestions += (bp.sectionRelationships?.length || 0);
-    totalQuestions += (bp.summaryQuestions?.length || 0);
+    totalQuestions +=
+      (bp.mainIdeas?.length            || 0) +
+      (bp.coreThemes?.length           || 0) +
+      (bp.purposeAndStructure?.length  || 0) +
+      (bp.sectionRelationships?.length || 0) +
+      (bp.summaryQuestions?.length     || 0);
   }
 
-  // Count section questions
   for (const section of sectionRecalls) {
-    totalConcepts += (section.concepts?.length || 0);
-    totalQuestions += (section.definitions?.length || 0);
-    totalQuestions += (section.processes?.length || 0);
-    totalQuestions += (section.examples?.length || 0);
-    totalQuestions += (section.comparisons?.length || 0);
-    totalQuestions += (section.applications?.length || 0);
-    totalQuestions += (section.criticalThinking?.length || 0);
+    totalConcepts  += (section.concepts?.length          || 0);
+    totalQuestions +=
+      (section.definitions?.length      || 0) +
+      (section.processes?.length        || 0) +
+      (section.examples?.length         || 0) +
+      (section.comparisons?.length      || 0) +
+      (section.applications?.length     || 0) +
+      (section.criticalThinking?.length || 0);
   }
 
-  // Add cross-section and final questions
-  totalQuestions += (bigPictureResponse.crossSectionConnections?.length || 0);
-  totalQuestions += (bigPictureResponse.finalReviewQuestions?.length || 0);
+  totalQuestions +=
+    (merged.crossSectionConnections?.length || 0) +
+    (merged.finalReviewQuestions?.length    || 0);
 
-  // Add glossary terms
-  if (summary?.glossary) {
-    totalConcepts += summary.glossary.length;
-  }
+  const summary = merged.simplifiedSummary;
+  if (summary?.glossary) totalConcepts += summary.glossary.length;
 
   return {
-    sectionsIdentified: sectionRecalls.length,
+    sectionsIdentified: merged.documentStructure?.length || 0,
     questionsGenerated: totalQuestions,
-    conceptsCovered: totalConcepts
+    conceptsCovered:    totalConcepts
   };
 }
