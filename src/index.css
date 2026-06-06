@@ -406,7 +406,7 @@ text-decoration: none;
 
 .project-delete {
   position:absolute; right:3px; top:3px;
-  width:16px; height:16px; border:none; background:none;
+  width:24px; height:24px; border:none; background:none;
   color:var(--text-muted); font-size:13px; cursor:pointer;
   border-radius:4px;
   display:flex; align-items:center; justify-content:center;
@@ -1022,7 +1022,7 @@ transition: max-height 0.3s ease-in-out;
   border:1px solid var(--border);
   border-radius:var(--radius-lg);
   margin-bottom:14px;
-  overflow:hidden;
+  overflow: auto;
   transition: border-color 0.3s ease, box-shadow 0.3s ease;
   box-shadow: var(--shadow-card);
 }
@@ -1551,14 +1551,24 @@ transition: max-height 0.3s ease-in-out;
 .empty-state h3 { font-size:15px; font-weight:700; color:var(--text-secondary); margin-bottom:7px; }
 .empty-state p { font-size:12.5px; }
 
-.error-msg {
-  padding:13px 16px;
-  background:var(--error-bg); border:1px solid rgba(248,113,113,0.18);
-  border-radius:var(--radius-md); color:var(--error);
-  font-size:12.5px; margin-top:14px;
-  display:flex; align-items:center; gap:7px;
-  animation:fadeIn 0.25s ease-out;
+  .error-msg {
+  padding: 13px 16px;
+  background: var(--error-bg); 
+  border: 1px solid rgba(248,113,113,0.18);
+  border-radius: var(--radius-md); 
+  color: var(--error);
+  font-size: 12.5px; 
+  margin-top: 10px;
+  display: flex; 
+  gap: 4px;
+  animation: fadeIn 0.25s ease-out;
+  align-items: flex-start;
+  word-break: break-word;
+  
+  /* Ensure it doesn't cause sudden structural layouts shrinks */
+  box-sizing: border-box; 
 }
+
 
 /* ===== RESPONSIVE ===== */
 @media (max-width:768px) {
@@ -1613,8 +1623,9 @@ transition: max-height 0.3s ease-in-out;
   .btn { justify-content:center; }
   .quiz-progress-header { flex-direction:column; align-items:flex-start; gap:6px; }
   .quiz-header-right { width:100%; justify-content:space-between; }
-  .page-container { padding:16px 12px 36px; height: auto;}
+  .page-container { padding:16px 16px 40px; }
   .home-hero h1 { font-size:24px; }
+  .error-msg {margin-bottom: 25px}
 
 }
 

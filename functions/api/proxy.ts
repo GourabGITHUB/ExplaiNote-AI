@@ -59,14 +59,16 @@ export const onRequestPost = async (context: {
     }
 
     // --- CORE API LOGIC ---
-    const secretKey = env.GEMINI_API_KEY;
-    if (!secretKey) {
-      return new Response(
-        JSON.stringify({ error: "Server API key configuration missing." }), 
-        { status: 500, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
+   // Extract user-supplied API key or fall back to server's deployment secret
+const userApiKey = request.headers.get("X-Gemini-Key");
+const secretKey = userApiKey ? userApiKey.trim() : env.GEMINI_API_KEY;
 
+if (!secretKey) {
+  return new Response(
+    JSON.stringify({ error: "API Authorization token missing. Please provide an API key." }), 
+    { status: 401, headers: { 'Content-Type': 'application/json' } }
+  );
+}
     const requestBody = await request.json();
     const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
     

@@ -8,7 +8,10 @@ import type {
   FlashCard
 } from '../types';
 
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+// ============ API CONFIGURATION ============
+
+const GEMINI_DIRECT_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent';
+const PROXY_ENDPOINT    = '/api/proxy';
 
 // ============ RETRY CONFIG ============
 
@@ -71,29 +74,10 @@ function enqueueSectionRequest<T>(fn: () => Promise<T>): Promise<T> {
 
 // ============ SHA-256 HASHING ============
 
-const CACHE_VERSION = 'v1';
+const CACHE_VERSION = 'v3';
 
-/**
- * Normalizes text for cache key generation.
- *
- * CRITICAL — must produce identical output regardless of:
- *  - Local dev vs Cloudflare edge (different V8 builds)
- *  - OS-level line ending differences (\r\n vs \n)
- *  - Unicode whitespace variants injected by PDF parsers, OCR, or
- *    edge request body normalization
- *
- * Steps:
- *  1. Strip ALL Unicode whitespace variants to a single ASCII space
- *     (covers \u00A0 NBSP, \u2000–\u200A typographic spaces,
- *      \u2028 line sep, \u2029 paragraph sep, \u202F narrow NBSP,
- *      \u205F medium math space, \u3000 ideographic space, \uFEFF BOM)
- *  2. Collapse consecutive spaces
- *  3. Lowercase
- *  4. Trim
- */
 function normalizeTextForHashing(text: string): string {
   return text
-    // Replace ALL Unicode whitespace with ASCII space
     .replace(/[\s\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]+/g, ' ')
     .toLowerCase()
     .trim();
@@ -126,9 +110,9 @@ async function buildCacheKey(prefix: string, text: string, extra?: string): Prom
 
 // ============ INDEXEDDB CACHE LAYER ============
 
-const DB_NAME    = 'ExplaiNoteCache';
-const DB_VERSION = 1;
-const STORE_NAME = 'gemini_responses';
+const DB_NAME      = 'ExplaiNoteCache';
+const DB_VERSION   = 3;
+const STORE_NAME   = 'gemini_responses';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 interface CacheEntry {
@@ -140,14 +124,12 @@ interface CacheEntry {
 function openCacheDB(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DB_NAME, DB_VERSION);
-
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains(STORE_NAME)) {
         db.createObjectStore(STORE_NAME, { keyPath: 'key' });
       }
     };
-
     request.onsuccess = () => resolve(request.result);
     request.onerror   = () => reject(request.error);
   });
@@ -160,21 +142,17 @@ async function getCached<T>(key: string): Promise<T | null> {
       const tx    = db.transaction(STORE_NAME, 'readonly');
       const store = tx.objectStore(STORE_NAME);
       const req   = store.get(key);
-
       req.onsuccess = () => {
         const entry = req.result as CacheEntry | undefined;
         if (!entry) { resolve(null); return; }
-
         if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
           const delTx = db.transaction(STORE_NAME, 'readwrite');
           delTx.objectStore(STORE_NAME).delete(key);
           resolve(null);
           return;
         }
-
         resolve(entry.data as T);
       };
-
       req.onerror = () => resolve(null);
     });
   } catch {
@@ -186,16 +164,24 @@ async function setCache(key: string, data: any): Promise<void> {
   try {
     const db = await openCacheDB();
     return new Promise((resolve) => {
-      const tx    = db.transaction(STORE_NAME, 'readwrite');
-      const store = tx.objectStore(STORE_NAME);
-      const entry: CacheEntry = { key, data, timestamp: Date.now() };
-      store.put(entry);
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).put({ key, data, timestamp: Date.now() } as CacheEntry);
       tx.oncomplete = () => resolve();
       tx.onerror    = () => resolve();
     });
-  } catch {
-    // Silently ignore
-  }
+  } catch { /* silently ignore */ }
+}
+
+async function deleteCache(key: string): Promise<void> {
+  try {
+    const db = await openCacheDB();
+    return new Promise((resolve) => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror    = () => resolve();
+    });
+  } catch { /* silently ignore */ }
 }
 
 export async function clearGeminiCache(): Promise<void> {
@@ -207,9 +193,7 @@ export async function clearGeminiCache(): Promise<void> {
       tx.oncomplete = () => resolve();
       tx.onerror    = () => resolve();
     });
-  } catch {
-    // Silently ignore
-  }
+  } catch { /* silently ignore */ }
 }
 
 // ============ JSON REPAIR PIPELINE ============
@@ -227,33 +211,19 @@ function normalizeLiteralWhitespace(text: string): string {
   let result = '';
   let insideString = false;
   let i = 0;
-
   while (i < text.length) {
     const char = text[i];
-
     if (char === '\\' && insideString && i + 1 < text.length) {
-      result += char + text[i + 1];
-      i += 2;
-      continue;
+      result += char + text[i + 1]; i += 2; continue;
     }
-
-    if (char === '"') {
-      insideString = !insideString;
-      result += char;
-      i++;
-      continue;
-    }
-
+    if (char === '"') { insideString = !insideString; result += char; i++; continue; }
     if (insideString) {
       if (char === '\n') { result += '\\n'; i++; continue; }
       if (char === '\r') { result += '\\r'; i++; continue; }
       if (char === '\t') { result += '\\t'; i++; continue; }
     }
-
-    result += char;
-    i++;
+    result += char; i++;
   }
-
   return result;
 }
 
@@ -261,63 +231,25 @@ function fixUnescapedQuotes(text: string): string {
   let result = '';
   let insideString = false;
   let i = 0;
-
   while (i < text.length) {
     const char = text[i];
-
     if (char === '\\' && i + 1 < text.length) {
-      result += char + text[i + 1];
-      i += 2;
-      continue;
+      result += char + text[i + 1]; i += 2; continue;
     }
-
     if (char === '"') {
-      if (!insideString) {
-        insideString = true;
-        result += char;
-        i++;
-        continue;
-      }
-
+      if (!insideString) { insideString = true; result += char; i++; continue; }
       const next = peekNextNonWhitespace(text, i + 1);
-      const isClosingQuote =
-        next === ',' ||
-        next === '}' ||
-        next === ']' ||
-        next === ':' ||
-        next === '';
-
-      if (isClosingQuote) {
-        insideString = false;
-        result += char;
-      } else {
-        result += '\\"';
-      }
-
-      i++;
-      continue;
+      const isClosing = next === ',' || next === '}' || next === ']' || next === ':' || next === '';
+      if (isClosing) { insideString = false; result += char; }
+      else { result += '\\"'; }
+      i++; continue;
     }
-
-    result += char;
-    i++;
+    result += char; i++;
   }
-
   return result;
 }
 
-/**
- * Peeks ahead past whitespace to find the next meaningful character.
- *
- * Safety: bounded by maxLookahead to prevent runaway scans on
- * truncated text where a quote lands at the very edge of the buffer.
- * Returns '' if nothing found within the window — callers treat
- * '' as "end of input / closing quote" which is the safe default.
- */
-function peekNextNonWhitespace(
-  text: string,
-  fromIndex: number,
-  maxLookahead: number = 64
-): string {
+function peekNextNonWhitespace(text: string, fromIndex: number, maxLookahead = 64): string {
   const limit = Math.min(fromIndex + maxLookahead, text.length);
   for (let j = fromIndex; j < limit; j++) {
     if (!/\s/.test(text[j])) return text[j];
@@ -329,88 +261,48 @@ function removeTrailingCommas(text: string): string {
   return text.replace(/,(\s*[}\]])/g, '$1');
 }
 
-/**
- * Extracts balanced JSON from opening bracket to its matched closer.
- *
- * Safety: bounded by MAX_SCAN_LENGTH to prevent infinite loops on
- * pathologically malformed input. If the text is longer than the
- * limit, we scan up to the limit and return null (triggering
- * truncation repair downstream).
- */
-function extractBalanced(
-  text: string,
-  startIdx: number,
-  openChar: string,
-  closeChar: string
-): string | null {
-  const MAX_SCAN_LENGTH = 500_000; // 500KB — well above any realistic response
-  let depth = 0;
-  let insideString = false;
-  let i = startIdx;
-  const end = Math.min(text.length, startIdx + MAX_SCAN_LENGTH);
-
+function extractBalanced(text: string, startIdx: number, openChar: string, closeChar: string): string | null {
+  const MAX_SCAN = 500_000;
+  let depth = 0, insideString = false, i = startIdx;
+  const end = Math.min(text.length, startIdx + MAX_SCAN);
   while (i < end) {
     const char = text[i];
-    if (char === '\\' && insideString) {
-      // Safety: if escape char is at the very last position, break
-      if (i + 1 >= end) break;
-      i += 2;
-      continue;
-    }
+    if (char === '\\' && insideString) { if (i + 1 >= end) break; i += 2; continue; }
     if (char === '"') { insideString = !insideString; i++; continue; }
     if (!insideString) {
-      if (char === openChar)  depth++;
+      if (char === openChar) depth++;
       if (char === closeChar) depth--;
       if (depth === 0) return text.slice(startIdx, i + 1);
     }
     i++;
   }
-
-  return null; // unbalanced or exceeded scan limit — triggers truncation repair
+  return null;
 }
 
 function attemptTruncationRepair(text: string): string {
   let insideString = false;
   const stack: string[] = [];
   let i = 0;
-
   while (i < text.length) {
     const char = text[i];
-
-    if (char === '\\' && insideString && i + 1 < text.length) {
-      i += 2;
-      continue;
-    }
-
-    if (char === '"') {
-      insideString = !insideString;
-      i++;
-      continue;
-    }
-
+    if (char === '\\' && insideString && i + 1 < text.length) { i += 2; continue; }
+    if (char === '"') { insideString = !insideString; i++; continue; }
     if (!insideString) {
       if (char === '{' || char === '[') stack.push(char);
       if (char === '}' || char === ']') stack.pop();
     }
-
     i++;
   }
-
   let repaired = text;
   if (insideString) repaired += '"';
-  for (let j = stack.length - 1; j >= 0; j--) {
-    repaired += stack[j] === '{' ? '}' : ']';
-  }
-
+  for (let j = stack.length - 1; j >= 0; j--) repaired += stack[j] === '{' ? '}' : ']';
   return repaired;
 }
 
 function extractJSON(text: string): string {
   const cleaned = stripRogueCharacters(text);
-
   const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenceMatch?.[1]?.trim()) return fenceMatch[1].trim();
-
   const firstBracket = cleaned.search(/[\[{]/);
   if (firstBracket !== -1) {
     const openChar  = cleaned[firstBracket];
@@ -419,32 +311,17 @@ function extractJSON(text: string): string {
     if (balanced) return balanced;
     return cleaned.slice(firstBracket);
   }
-
   return cleaned;
 }
 
-/**
- * Sequential cascading JSON repair pipeline.
- *
- * Each stage feeds its output into the next, so a response with
- * multiple issues (raw newlines + trailing commas + rogue quotes)
- * gets all fixes applied cumulatively.
- *
- * We try JSON.parse after EVERY stage so clean responses exit early.
- * An alt pipeline (truncation-first) runs as a final fallback for
- * responses truncated mid-string.
- */
 function safeParseJSON<T>(text: string): T {
-  const stages: Array<{
-    name: string;
-    transform: (input: string) => string;
-  }> = [
-    { name: 'raw',                      transform: (s) => s                           },
-    { name: 'strip-rogue-chars',        transform: (s) => stripRogueCharacters(s)     },
-    { name: '+ normalize-whitespace',   transform: (s) => normalizeLiteralWhitespace(s) },
-    { name: '+ remove-trailing-commas', transform: (s) => removeTrailingCommas(s)     },
-    { name: '+ fix-unescaped-quotes',   transform: (s) => fixUnescapedQuotes(s)       },
-    { name: '+ truncation-repair',      transform: (s) => attemptTruncationRepair(s)  },
+  const stages: Array<{ name: string; transform: (s: string) => string }> = [
+    { name: 'raw',                      transform: s => s },
+    { name: 'strip-rogue-chars',        transform: s => stripRogueCharacters(s) },
+    { name: '+ normalize-whitespace',   transform: s => normalizeLiteralWhitespace(s) },
+    { name: '+ remove-trailing-commas', transform: s => removeTrailingCommas(s) },
+    { name: '+ fix-unescaped-quotes',   transform: s => fixUnescapedQuotes(s) },
+    { name: '+ truncation-repair',      transform: s => attemptTruncationRepair(s) },
   ];
 
   const errors: string[] = [];
@@ -452,44 +329,44 @@ function safeParseJSON<T>(text: string): T {
 
   for (const stage of stages) {
     current = stage.transform(current);
-
     try {
       const parsed = JSON.parse(current);
-      if (stage.name !== 'raw') {
-        console.warn(`[safeParseJSON] Recovered at stage: "${stage.name}"`);
-      }
+      if (stage.name !== 'raw') console.warn(`[safeParseJSON] Recovered at: "${stage.name}"`);
       return parsed as T;
     } catch (err: any) {
       errors.push(`  • [${stage.name}]: ${err.message}`);
     }
   }
 
-  // Alt pipeline: truncation repair BEFORE quote fixing
   try {
-    const alt = fixUnescapedQuotes(
-      removeTrailingCommas(
-        attemptTruncationRepair(
-          normalizeLiteralWhitespace(
-            stripRogueCharacters(text)
-          )
-        )
-      )
-    );
+    const alt = fixUnescapedQuotes(removeTrailingCommas(attemptTruncationRepair(
+      normalizeLiteralWhitespace(stripRogueCharacters(text))
+    )));
     const parsed = JSON.parse(alt);
-    console.warn('[safeParseJSON] Recovered with alt pipeline (truncation-first)');
+    console.warn('[safeParseJSON] Recovered with alt pipeline');
     return parsed as T;
   } catch (err: any) {
     errors.push(`  • [alt-truncation-first]: ${err.message}`);
   }
 
   throw new Error(
-    `[safeParseJSON] All strategies failed.\n` +
-    `Attempted:\n${errors.join('\n')}\n` +
-    `Input (first 500 chars):\n${text.slice(0, 500)}`
+    `[safeParseJSON] All strategies failed.\n${errors.join('\n')}\nInput (500 chars):\n${text.slice(0, 500)}`
   );
 }
 
-// ============ GEMINI FETCH WITH RETRY ============
+// ============ GEMINI FETCH ============
+
+function resolveTargetUrl(userApiKey: string): { url: string; headers: Record<string, string> } {
+  const trimmedKey = userApiKey.trim();
+  return {
+    url: PROXY_ENDPOINT,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-App-Client':  'ExplaiNote-SPA-Client',
+      ...(trimmedKey ? { 'X-Gemini-Key': trimmedKey } : {}),
+    },
+  };
+}
 
 async function callGeminiWithRetry<T>(
   userApiKey: string,
@@ -497,75 +374,51 @@ async function callGeminiWithRetry<T>(
   config: RetryConfig = DEFAULT_RETRY_CONFIG
 ): Promise<T> {
   let lastError: Error | null = null;
-
-  const trimmedUserKey = userApiKey.trim();
-  const targetUrl = trimmedUserKey
-    ? `${GEMINI_API_URL}?key=${trimmedUserKey}`
-    : `/api/proxy`;
+  const { url: targetUrl, headers } = resolveTargetUrl(userApiKey);
 
   for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
     try {
       const response = await fetch(targetUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-App-Client': 'ExplaiNote-SPA-Client',
-        },
+        headers,
         body: JSON.stringify(requestBody),
       });
 
       if (!response.ok) {
         const errData    = await response.json().catch(() => ({}));
         const errMessage = errData?.error?.message || `API error: ${response.status}`;
-
         if (isRetryableError(response.status) && attempt < config.maxRetries) {
           const delay = Math.min(
             config.baseDelayMs * Math.pow(2, attempt) + Math.random() * 500,
             config.maxDelayMs
           );
-          console.warn(
-            `[callGeminiWithRetry] HTTP ${response.status} — ` +
-            `retrying attempt ${attempt + 1}/${config.maxRetries} in ${Math.round(delay)}ms…`
-          );
+          console.warn(`[callGemini] HTTP ${response.status} — retry ${attempt + 1}/${config.maxRetries} in ${Math.round(delay)}ms`);
           await sleep(delay);
           continue;
         }
-
         throw new Error(errMessage);
       }
 
-      const data    = await response.json();
-      const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
+      const data         = await response.json();
+      const rawText      = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
+      const finishReason = data?.candidates?.[0]?.finishReason;
 
       if (!rawText) {
-        const finishReason = data?.candidates?.[0]?.finishReason;
-        if (finishReason === 'MAX_TOKENS') {
-          throw new Error('Response cut off — token limit exceeded. Try shorter content.');
-        }
+        if (finishReason === 'MAX_TOKENS') throw new Error('Response cut off — token limit exceeded.');
         throw new Error('No response content from AI');
       }
+      if (finishReason === 'MAX_TOKENS') console.warn('[callGemini] MAX_TOKENS hit — attempting repair…');
 
-      const finishReason = data?.candidates?.[0]?.finishReason;
-      if (finishReason === 'MAX_TOKENS') {
-        console.warn('[callGeminiWithRetry] Response hit MAX_TOKENS — attempting repair…');
-      }
-
-      const jsonStr = extractJSON(rawText);
-      return safeParseJSON<T>(jsonStr);
+      return safeParseJSON<T>(extractJSON(rawText));
 
     } catch (err: any) {
       lastError = err;
-
       if (attempt < config.maxRetries && err.name === 'TypeError') {
         const delay = config.baseDelayMs * Math.pow(2, attempt);
-        console.warn(
-          `[callGeminiWithRetry] Network error — ` +
-          `retrying attempt ${attempt + 1}/${config.maxRetries}…`
-        );
+        console.warn(`[callGemini] Network error — retry ${attempt + 1}/${config.maxRetries}`);
         await sleep(delay);
         continue;
       }
-
       throw err;
     }
   }
@@ -606,7 +459,7 @@ const simplifiedSectionSchema = {
   required: ["heading", "simpleExplanation", "keyPoints"]
 };
 
-const mergedSummaryBigPictureSchema = {
+const summaryResponseSchema = {
   type: "OBJECT",
   properties: {
     documentOverview:  { type: "STRING" },
@@ -623,8 +476,15 @@ const mergedSummaryBigPictureSchema = {
         quickRecap:      { type: "STRING" },
         glossary:        { type: "ARRAY", items: keyConceptSchema }
       },
-      required: ["title", "oneLinerSummary", "whyItMatters", "coreIdea", "sections", "keyTakeaways", "quickRecap"]
-    },
+      required: ["title", "oneLinerSummary", "whyItMatters", "coreIdea", "sections", "keyTakeaways", "quickRecap", "glossary"]
+    }
+  },
+  required: ["documentOverview", "documentStructure", "simplifiedSummary"]
+};
+
+const bigPictureResponseSchema = {
+  type: "OBJECT",
+  properties: {
     bigPictureRecall: {
       type: "OBJECT",
       properties: {
@@ -634,15 +494,15 @@ const mergedSummaryBigPictureSchema = {
         sectionRelationships: { type: "ARRAY", items: flashCardSchema },
         summaryQuestions:     { type: "ARRAY", items: flashCardSchema }
       },
-      required: ["mainIdeas", "coreThemes", "purposeAndStructure"]
+      required: ["mainIdeas", "coreThemes", "purposeAndStructure", "sectionRelationships", "summaryQuestions"]
     },
     crossSectionConnections: { type: "ARRAY", items: flashCardSchema },
     finalReviewQuestions:    { type: "ARRAY", items: flashCardSchema }
   },
-  required: ["documentOverview", "documentStructure", "simplifiedSummary", "bigPictureRecall"]
+  required: ["bigPictureRecall", "crossSectionConnections", "finalReviewQuestions"]
 };
 
-const singleSectionRecallSchema = {
+const sectionRecallSchema = {
   type: "OBJECT",
   properties: {
     sectionTitle:     { type: "STRING" },
@@ -655,43 +515,19 @@ const singleSectionRecallSchema = {
     applications:     { type: "ARRAY", items: flashCardSchema },
     criticalThinking: { type: "ARRAY", items: flashCardSchema }
   },
-  required: ["sectionTitle", "sectionSummary"]
+  required: ["sectionTitle", "sectionSummary", "concepts", "definitions"]
 };
-
-const sectionRecallResponseSchema = {
-  type: "OBJECT",
-  properties: {
-    sectionRecall: singleSectionRecallSchema
-  },
-  required: ["sectionRecall"]
-};
-
-// ── QUIZ SCHEMAS: ONE UNIFIED SCHEMA FOR ALL TYPES ──
-//
-// The previous approach used anyOf for mixed quizzes, which caused
-// Gemini to silently drop the options field on MCQ questions. The
-// result: validateAndRepairQuiz would filter them out, and users
-// got fewer questions than they asked for.
-//
-// NEW APPROACH: One single schema with options ALWAYS required.
-// The prompt controls which types are generated.
-// validateAndRepairQuiz handles cleanup (e.g. stripping dummy
-// options from short-answer, normalizing true-false options).
 
 const quizQuestionSchema = {
   type: "OBJECT",
   properties: {
-    id:            { type: "INTEGER" },
+    id:            { type: "NUMBER" },
     type:          { type: "STRING", enum: ["mcq", "true-false", "short-answer"] },
     question:      { type: "STRING" },
     options:       { type: "ARRAY", items: { type: "STRING" } },
     correctAnswer: { type: "STRING" },
-    explanation:   { type: "STRING" },
-    section:       { type: "STRING" }
+    explanation:   { type: "STRING" }
   },
-  // options IS required in the schema — Gemini will ALWAYS return it.
-  // For short-answer, the prompt says to use an empty array [].
-  // validateAndRepairQuiz strips it post-parse.
   required: ["id", "type", "question", "options", "correctAnswer", "explanation"]
 };
 
@@ -705,113 +541,266 @@ const quizResponseSchema = {
 
 // ============ SYSTEM INSTRUCTIONS ============
 
-const MERGED_SYSTEM_INSTRUCTION = `You are an expert educational content designer.
+const SUMMARY_SYSTEM_INSTRUCTION = `You are an expert educational content designer using the Feynman technique.
+Explain as if teaching a 12-year-old. Simple language, analogies, examples.
+Keep every text field to 1-2 sentences max. Valid JSON only.`;
 
-SUMMARY (Feynman technique): Explain as if teaching a 12-year-old. Use simple language, analogies, examples. Keep every field to 1-2 sentences max.
-
-RECALL QUESTIONS: Cover main ideas, themes, structure. Each question needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence.
-
-CRITICAL: Be extremely concise. Valid JSON only.`;
-
-const SECTION_RECALL_SYSTEM_INSTRUCTION = `You are an active recall expert. Create focused recall questions for one section. Each needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence. Skip empty categories. Valid JSON only.`;
-
-const QUIZ_SYSTEM_INSTRUCTION = `You are a quiz generator. STRICT RULES:
-- "mcq": "options" must have EXACTLY 4 strings. correctAnswer must match one option exactly.
-- "true-false": "options" must be ["True", "False"]. correctAnswer must be "True" or "False".
-- "short-answer": "options" must be an empty array []. correctAnswer is 1-3 words.
-- EVERY question MUST have the "options" field (array).
-- Explanations: 1 sentence max.
+const BIGPICTURE_SYSTEM_INSTRUCTION = `You are an active recall expert.
+Create big-picture recall questions covering main ideas, themes, structure, and connections.
+Each question needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1 sentence.
+EVERY array field must contain at least 1 item. Never return empty arrays.
 Valid JSON only.`;
 
-// ============ INPUT BUDGET CONSTANTS ============
+const SECTION_RECALL_SYSTEM_INSTRUCTION = `You are an active recall expert.
+Create focused recall questions for one section.
+Each question needs difficulty ("basic"/"intermediate"/"advanced"). Answers: 1-2 sentences.
+You MUST generate: sectionSummary, at least 2 concepts, and at least 1 definition.
+Never return empty arrays for concepts or definitions.
+Valid JSON only.`;
+
+const QUIZ_SYSTEM_INSTRUCTION = `You are a quiz generator. STRICT RULES:
+
+EVERY question MUST have ALL fields: id, type, question, options, correctAnswer, explanation.
+
+TYPE RULES:
+- "mcq": "options" = EXACTLY 4 strings. "correctAnswer" MUST exactly match one option.
+- "true-false": "options" = ["True", "False"]. "correctAnswer" = "True" or "False" (factually correct).
+- "short-answer": "options" = []. "correctAnswer" = 1-3 words.
+
+CRITICAL:
+- correctAnswer must NEVER be empty.
+- correctAnswer must be FACTUALLY CORRECT.
+- Generate EXACTLY the requested number of questions.
+Valid JSON only.`;
+
+// ============ INPUT LIMITS ============
 
 const INPUT_LIMITS = {
-  merged:  10000,
-  section: 2000,
-  quiz:    8000,
+  summary:    10000,
+  bigPicture: 8000,
+  section:    3000,
+  quiz:       8000,
 } as const;
 
-// ============ REQUEST BUILDERS ============
+// ============ CACHE HEALTH THRESHOLDS ============
 
-interface MergedResponse {
-  documentOverview:         string;
-  documentStructure:        string[];
-  simplifiedSummary:        SimplifiedSummary;
-  bigPictureRecall:         BigPictureRecall;
-  crossSectionConnections?: FlashCard[];
-  finalReviewQuestions?:    FlashCard[];
+const QUIZ_CACHE_HEALTH_RATIO    = 0.6;
+const QUIZ_CACHE_MIN_ABSOLUTE    = 2;
+const SECTION_CACHE_MIN_ITEMS    = 1;
+const MIN_SECTIONS_FOR_BIGPICTURE = 1;
+
+// ============ RESPONSE INTERFACES ============
+
+interface SummaryResponse {
+  documentOverview:  string;
+  documentStructure: string[];
+  simplifiedSummary: SimplifiedSummary;
 }
 
-interface SectionRecallResponse {
-  sectionRecall: SectionRecall;
+interface BigPictureResponse {
+  bigPictureRecall:        BigPictureRecall;
+  crossSectionConnections: FlashCard[];
+  finalReviewQuestions:    FlashCard[];
 }
 
 interface QuizResponse {
   questions: QuizQuestion[];
 }
 
-function buildMergedSummaryBigPictureRequest(text: string) {
+// ============ COVERAGE TYPES ============
+
+export interface CoverageMetrics {
+  sectionsIdentified: number;
+  sectionsLoaded:     number;
+  questionsGenerated: number;
+  conceptsCovered:    number;
+  expectedQuestions:  number;
+}
+
+// ============ SAFE UNWRAP UTILITIES ============
+
+function unwrapSectionRecall(response: any, fallbackTitle: string): SectionRecall {
+  if (!response || typeof response !== 'object') return createEmptySectionRecall(fallbackTitle);
+  const inner = response.sectionRecall || response;
   return {
-    systemInstruction: {
-      parts: [{ text: MERGED_SYSTEM_INSTRUCTION }]
+    sectionTitle:     inner.sectionTitle     || fallbackTitle,
+    sectionSummary:   inner.sectionSummary   || '',
+    concepts:         Array.isArray(inner.concepts)         ? inner.concepts         : [],
+    definitions:      Array.isArray(inner.definitions)      ? inner.definitions      : [],
+    processes:        Array.isArray(inner.processes)        ? inner.processes        : [],
+    examples:         Array.isArray(inner.examples)         ? inner.examples         : [],
+    comparisons:      Array.isArray(inner.comparisons)      ? inner.comparisons      : [],
+    applications:     Array.isArray(inner.applications)     ? inner.applications     : [],
+    criticalThinking: Array.isArray(inner.criticalThinking) ? inner.criticalThinking : [],
+  };
+}
+
+function unwrapBigPicture(response: any): BigPictureResponse {
+  if (!response || typeof response !== 'object') {
+    return { bigPictureRecall: createEmptyBigPictureRecall(), crossSectionConnections: [], finalReviewQuestions: [] };
+  }
+  const bp = response.bigPictureRecall || {};
+  return {
+    bigPictureRecall: {
+      mainIdeas:            Array.isArray(bp.mainIdeas)            ? bp.mainIdeas            : [],
+      coreThemes:           Array.isArray(bp.coreThemes)           ? bp.coreThemes           : [],
+      purposeAndStructure:  Array.isArray(bp.purposeAndStructure)  ? bp.purposeAndStructure  : [],
+      sectionRelationships: Array.isArray(bp.sectionRelationships) ? bp.sectionRelationships : [],
+      summaryQuestions:     Array.isArray(bp.summaryQuestions)     ? bp.summaryQuestions     : [],
     },
+    crossSectionConnections: Array.isArray(response.crossSectionConnections) ? response.crossSectionConnections : [],
+    finalReviewQuestions:    Array.isArray(response.finalReviewQuestions)    ? response.finalReviewQuestions    : [],
+  };
+}
+
+/**
+ * Unwraps and validates a summary response.
+ *
+ * After unwrapping, if documentStructure is empty, attempts to recover
+ * section titles from simplifiedSummary.sections[].heading — Gemini
+ * almost always populates sections even when documentStructure is blank.
+ * This prevents the downstream "Document sections: " schema violation
+ * without requiring a full retry.
+ */
+function unwrapSummary(response: any): SummaryResponse {
+  if (!response || typeof response !== 'object') {
+    return {
+      documentOverview:  '',
+      documentStructure: [],
+      simplifiedSummary: {
+        title: '', oneLinerSummary: '', whyItMatters: '', coreIdea: '',
+        sections: [], keyTakeaways: [], quickRecap: '', glossary: [],
+      } as SimplifiedSummary,
+    };
+  }
+
+  const ss = response.simplifiedSummary || {};
+
+  // Parse documentStructure — filter out any non-string or blank entries
+  let documentStructure: string[] = Array.isArray(response.documentStructure)
+    ? response.documentStructure.filter(
+        (s: any) => typeof s === 'string' && s.trim().length > 0
+      )
+    : [];
+
+  // Validate that each entry is substantive (more than 2 chars)
+  documentStructure = documentStructure.filter(s => s.trim().length > 2);
+
+  return {
+    documentOverview:  typeof response.documentOverview === 'string' ? response.documentOverview : '',
+    documentStructure,
+    simplifiedSummary: {
+      title:           typeof ss.title           === 'string' ? ss.title           : '',
+      oneLinerSummary: typeof ss.oneLinerSummary === 'string' ? ss.oneLinerSummary : '',
+      whyItMatters:    typeof ss.whyItMatters    === 'string' ? ss.whyItMatters    : '',
+      coreIdea:        typeof ss.coreIdea        === 'string' ? ss.coreIdea        : '',
+      sections:        Array.isArray(ss.sections)     ? ss.sections     : [],
+      keyTakeaways:    Array.isArray(ss.keyTakeaways) ? ss.keyTakeaways : [],
+      quickRecap:      typeof ss.quickRecap === 'string' ? ss.quickRecap : '',
+      glossary:        Array.isArray(ss.glossary) ? ss.glossary : [],
+    } as SimplifiedSummary,
+  };
+}
+
+// ============ REQUEST BUILDERS ============
+
+function buildSummaryRequest(text: string) {
+  return {
+    systemInstruction: { parts: [{ text: SUMMARY_SYSTEM_INSTRUCTION }] },
     contents: [{
       parts: [{
-        text: `Analyze and produce BOTH a simplified summary AND big-picture recall in one JSON.
+        text: `Create a simplified summary using the Feynman technique.
 
-SUMMARY:
-- documentStructure: 3-4 section titles
+- documentStructure: 3-4 section titles found in the document
 - title, oneLinerSummary: 1 sentence each
 - whyItMatters, coreIdea: 1 sentence each
-- sections: MAX 3, each: simpleExplanation(1 sentence), 3 keyPoints(1 sentence each), analogy(1 sentence), realWorldExample(1 sentence)
-- keyTakeaways: MAX 3 (1 sentence each)
+- sections: MAX 3, each with: simpleExplanation (1 sentence), 3 keyPoints, analogy, realWorldExample
+- keyTakeaways: MAX 3 items
 - quickRecap: 1 sentence
 - glossary: MAX 3 terms
 
-RECALL (9 questions total, 1 sentence answers):
-- mainIdeas:2, coreThemes:2, purposeAndStructure:1, sectionRelationships:1, summaryQuestions:1, crossSectionConnections:1, finalReviewQuestions:1
-
 CONTENT:
 """
-${text.substring(0, INPUT_LIMITS.merged)}
+${text.substring(0, INPUT_LIMITS.summary)}
 """`
       }]
     }],
     generationConfig: {
-      temperature: 0.4,
-      topP: 0.9,
-      maxOutputTokens: 3500,
+      temperature: 0.3,
+      topP: 0.85,
+      maxOutputTokens: 2500,
       responseMimeType: "application/json",
-      responseSchema: mergedSummaryBigPictureSchema
+      responseSchema: summaryResponseSchema
+    }
+  };
+}
+
+function buildBigPictureRequest(text: string, documentStructure: string[]) {
+  // documentStructure is guaranteed non-empty by the call-site guard
+  const sections = documentStructure.slice(0, 4).join(', ');
+  return {
+    systemInstruction: { parts: [{ text: BIGPICTURE_SYSTEM_INSTRUCTION }] },
+    contents: [{
+      parts: [{
+        text: `Create big-picture recall questions for a document with these sections: ${sections}
+
+Generate ALL of these (1 sentence answers each):
+- mainIdeas: 2 questions about the central thesis
+- coreThemes: 2 questions about recurring themes
+- purposeAndStructure: 1 question about the author's purpose
+- sectionRelationships: 1 question linking the sections above
+- summaryQuestions: 1 comprehensive question
+- crossSectionConnections: 1 question connecting concepts across sections
+- finalReviewQuestions: 1 final review question
+
+TOTAL: exactly 9 questions. EVERY array must have at least 1 item.
+
+CONTENT:
+"""
+${text.substring(0, INPUT_LIMITS.bigPicture)}
+"""`
+      }]
+    }],
+    generationConfig: {
+      temperature: 0.3,
+      topP: 0.85,
+      maxOutputTokens: 1500,
+      responseMimeType: "application/json",
+      responseSchema: bigPictureResponseSchema
     }
   };
 }
 
 function buildSectionRecallRequest(sectionTitle: string, sectionContent: string) {
   return {
-    systemInstruction: {
-      parts: [{ text: SECTION_RECALL_SYSTEM_INSTRUCTION }]
-    },
+    systemInstruction: { parts: [{ text: SECTION_RECALL_SYSTEM_INSTRUCTION }] },
     contents: [{
       parts: [{
-        text: `Section: "${sectionTitle}"
+        text: `Create recall questions for this section.
 
-Limits (1 sentence answers, skip N/A):
-- sectionSummary:1 sentence, concepts:max 2, definitions:max 1, processes:max 1, examples:max 1, comparisons:max 1, applications:max 1, criticalThinking:max 1
-Total: max 7 questions.
+SECTION: "${sectionTitle}"
 
-Content:
+REQUIREMENTS (1-2 sentence answers):
+- sectionSummary: 1-2 sentences (REQUIRED)
+- concepts: 2 key concepts with explanations (REQUIRED)
+- definitions: 1-2 definition questions, basic difficulty (REQUIRED)
+- processes: 1 question if applicable (intermediate)
+- examples: 1 question if applicable (intermediate)
+- applications: 1 question (advanced)
+Minimum: sectionSummary + 2 concepts + 1 definition.
+
+CONTENT:
 """
-${sectionContent.substring(0, INPUT_LIMITS.section)}
+${sectionContent}
 """`
       }]
     }],
     generationConfig: {
-      temperature: 0.4,
-      topP: 0.9,
-      maxOutputTokens: 800,
+      temperature: 0.3,
+      topP: 0.85,
+      maxOutputTokens: 1000,
       responseMimeType: "application/json",
-      responseSchema: sectionRecallResponseSchema
+      responseSchema: sectionRecallSchema
     }
   };
 }
@@ -820,24 +809,21 @@ function buildQuizRequest(text: string, questionType: QuizQuestionType, numQuest
   const safeNum = Math.min(Math.max(numQuestions, 1), 10);
 
   const typeInstructions: Record<string, string> = {
-    mcq:            `All ${safeNum} questions MUST be "mcq". Each MUST have "options" with EXACTLY 4 strings. correctAnswer must match one option exactly.`,
-    'true-false':   `All ${safeNum} questions MUST be "true-false". Each MUST have "options": ["True", "False"]. correctAnswer must be "True" or "False".`,
-    'short-answer': `All ${safeNum} questions MUST be "short-answer". Each MUST have "options": [] (empty array). correctAnswer is 1-3 words.`,
-    mixed:          `Mix of "mcq", "true-false", and "short-answer". EVERY question MUST have the "options" field. MCQ: exactly 4 option strings. True-false: ["True", "False"]. Short-answer: [] (empty array).`
+    mcq:            `All ${safeNum} questions MUST be "mcq". Each MUST have "options" with EXACTLY 4 strings. "correctAnswer" MUST exactly match one option.`,
+    'true-false':   `All ${safeNum} questions MUST be "true-false". Each MUST have "options": ["True", "False"]. "correctAnswer" must be the FACTUALLY CORRECT one.`,
+    'short-answer': `All ${safeNum} questions MUST be "short-answer". Each MUST have "options": []. "correctAnswer" = 1-3 words.`,
+    mixed:          `Mix of mcq, true-false, short-answer. MCQ: exactly 4 options. True-false: ["True","False"]. Short-answer: []. ALL must have non-empty correctAnswer.`
   };
 
   return {
-    systemInstruction: {
-      parts: [{ text: QUIZ_SYSTEM_INSTRUCTION }]
-    },
+    systemInstruction: { parts: [{ text: QUIZ_SYSTEM_INSTRUCTION }] },
     contents: [{
       parts: [{
-        text: `Create exactly ${safeNum} questions.
+        text: `Create EXACTLY ${safeNum} questions. Not ${safeNum - 1}, not ${safeNum + 1}. Exactly ${safeNum}.
 
 ${typeInstructions[questionType] || typeInstructions.mixed}
 
-IMPORTANT: Every question object MUST include the "options" field.
-Explanations: 1 sentence max.
+CRITICAL: Generate exactly ${safeNum} complete questions. Every correctAnswer must be factually correct and non-empty.
 
 Content:
 """
@@ -846,190 +832,298 @@ ${text.substring(0, INPUT_LIMITS.quiz)}
       }]
     }],
     generationConfig: {
-      temperature: 0.4,
-      topP: 0.9,
-      maxOutputTokens: 1200,
+      temperature: 0.3,
+      topP: 0.85,
+      maxOutputTokens: 3000, // Increased from 1500 — handles 10 MCQ questions comfortably
       responseMimeType: "application/json",
       responseSchema: quizResponseSchema
     }
   };
 }
 
+// ============ SECTION CONTENT EXTRACTION ============
+
+function extractSectionContent(fullText: string, sectionTitle: string, allSections: string[]): string {
+  const lowerText  = fullText.toLowerCase();
+  const lowerTitle = sectionTitle.toLowerCase().trim();
+
+  let startIndex = lowerText.indexOf(lowerTitle);
+
+  if (startIndex === -1) {
+    const cleanTitle = lowerTitle.replace(/["""''()\[\]{}&:;,.\-–—]/g, '').replace(/\s+/g, ' ').trim();
+    if (cleanTitle.length > 5) startIndex = lowerText.indexOf(cleanTitle);
+  }
+
+  if (startIndex === -1) {
+    const words = lowerTitle.split(/\s+/).filter(w => w.length > 3).sort((a, b) => b.length - a.length);
+    for (let w = 0; w < words.length - 1 && startIndex === -1; w++) {
+      const idx = lowerText.indexOf(words[w] + ' ' + words[w + 1]);
+      if (idx !== -1) startIndex = idx;
+    }
+    if (startIndex === -1) {
+      for (const word of words) {
+        const idx = lowerText.indexOf(word);
+        if (idx !== -1) { startIndex = idx; break; }
+      }
+    }
+  }
+
+  if (startIndex === -1) {
+    const sectionIndex = Math.max(0, allSections.indexOf(sectionTitle));
+    const chunkSize    = Math.floor(fullText.length / Math.max(allSections.length, 1));
+    const chunkStart   = Math.max(0, sectionIndex * chunkSize);
+    console.warn(`[extractSection] Positional fallback for "${sectionTitle}"`);
+    return fullText.substring(chunkStart, Math.min(fullText.length, chunkStart + INPUT_LIMITS.section));
+  }
+
+  let endIndex = fullText.length;
+  const currentIdx = allSections.indexOf(sectionTitle);
+
+  if (currentIdx !== -1) {
+    for (let i = currentIdx + 1; i < allSections.length; i++) {
+      const nextTitle = allSections[i].toLowerCase().trim();
+      let nextIdx = lowerText.indexOf(nextTitle, startIndex + lowerTitle.length);
+      if (nextIdx === -1) {
+        const cleanNext = nextTitle.replace(/["""''()\[\]{}&:;,.\-–—]/g, '').replace(/\s+/g, ' ').trim();
+        if (cleanNext.length > 5) nextIdx = lowerText.indexOf(cleanNext, startIndex + lowerTitle.length);
+      }
+      if (nextIdx !== -1 && nextIdx < endIndex) { endIndex = nextIdx; break; }
+    }
+  }
+
+  const contextStart = Math.max(0, startIndex - 200);
+  const maxEnd       = Math.min(endIndex, startIndex + INPUT_LIMITS.section);
+  const content      = fullText.substring(contextStart, maxEnd);
+
+  if (content.length < 300 && fullText.length > 300) {
+    return fullText.substring(contextStart, Math.min(fullText.length, contextStart + INPUT_LIMITS.section));
+  }
+
+  return content;
+}
+
 // ============ QUIZ POST-PROCESSING ============
 
-/**
- * Validates, repairs, and backfills quiz questions after parsing.
- *
- * DESIGN PRINCIPLE: Never silently drop questions. Repair first,
- * filter only as an absolute last resort (missing question text
- * or correctAnswer entirely). Logs every repair for debugging.
- *
- * @param questions - Raw parsed questions from Gemini
- * @param requestedCount - How many the user asked for (used to log shortfall)
- * @returns Repaired and validated questions
- */
 function validateAndRepairQuiz(
   questions: QuizQuestion[],
   requestedCount: number
-): QuizQuestion[] {
+): { questions: QuizQuestion[]; isHealthy: boolean } {
+
+  if (!Array.isArray(questions) || questions.length === 0) {
+    return { questions: [], isHealthy: false };
+  }
+
   const repaired = questions.map((q, i) => {
     const fixed = { ...q, id: i };
+    const rawQ  = q as any;
 
-    // ── Normalize type field ──
+    // Normalize type
     if (!fixed.type || !['mcq', 'true-false', 'short-answer'].includes(fixed.type)) {
-      // Infer type from structure
-      if (Array.isArray(fixed.options) && fixed.options.length === 4) {
-        fixed.type = 'mcq' as any;
-      } else if (
-        Array.isArray(fixed.options) &&
-        fixed.options.length === 2 &&
-        fixed.options.some(o => o.toLowerCase() === 'true')
-      ) {
+      if (Array.isArray(fixed.options) && fixed.options.length === 4) fixed.type = 'mcq' as any;
+      else if (Array.isArray(fixed.options) && fixed.options.length === 2 &&
+        fixed.options.some(o => typeof o === 'string' && o.toLowerCase() === 'true'))
         fixed.type = 'true-false' as any;
-      } else {
-        fixed.type = 'short-answer' as any;
-      }
-      console.warn(`[quiz-repair] Q${i}: inferred type "${fixed.type}" from structure`);
+      else fixed.type = 'short-answer' as any;
     }
 
-    // ── MCQ repairs ──
+    // Rescue correctAnswer — never guess
+    if (!fixed.correctAnswer?.trim()) {
+      let rescued = false;
+      if (rawQ.answer?.trim()) { fixed.correctAnswer = rawQ.answer.trim(); rescued = true; }
+      if (!rescued && rawQ.correct_answer?.trim()) { fixed.correctAnswer = rawQ.correct_answer.trim(); rescued = true; }
+      if (!rescued && fixed.explanation) {
+        const patterns = [
+          /(?:answer|correct)\s+(?:is|was)\s+[""']([^""']+)[""']/i,
+          /(?:answer|correct)\s+(?:is|was)\s+(\S+)/i,
+        ];
+        for (const p of patterns) {
+          const m = fixed.explanation.match(p);
+          if (m?.[1]?.trim()) { fixed.correctAnswer = m[1].trim(); rescued = true; break; }
+        }
+      }
+      if (!rescued) fixed.correctAnswer = '';
+    }
+
+    // MCQ repairs
     if (fixed.type === 'mcq') {
-      if (!Array.isArray(fixed.options)) {
-        fixed.options = [];
-        console.warn(`[quiz-repair] Q${i}: MCQ missing options — created empty array`);
-      }
-
-      // Ensure correctAnswer is in options
+      if (!Array.isArray(fixed.options)) fixed.options = [];
       if (fixed.options.length > 0 && fixed.correctAnswer && !fixed.options.includes(fixed.correctAnswer)) {
-        // Try case-insensitive match first
-        const caseMatch = fixed.options.findIndex(
-          o => o.toLowerCase().trim() === fixed.correctAnswer.toLowerCase().trim()
+        const caseIdx = fixed.options.findIndex(
+          o => typeof o === 'string' && o.toLowerCase().trim() === fixed.correctAnswer.toLowerCase().trim()
         );
-        if (caseMatch !== -1) {
-          fixed.correctAnswer = fixed.options[caseMatch];
-          console.warn(`[quiz-repair] Q${i}: corrected answer case to match option`);
-        } else {
-          fixed.options[fixed.options.length - 1] = fixed.correctAnswer;
-          console.warn(`[quiz-repair] Q${i}: replaced last option with correctAnswer`);
-        }
+        if (caseIdx !== -1) fixed.correctAnswer = fixed.options[caseIdx];
+        else fixed.options[fixed.options.length - 1] = fixed.correctAnswer;
       }
-
-      // Pad to 4 options
-      while (fixed.options.length < 4) {
-        fixed.options.push(`Option ${String.fromCharCode(65 + fixed.options.length)}`);
-        console.warn(`[quiz-repair] Q${i}: padded to ${fixed.options.length} options`);
-      }
-
-      // Trim to 4 options (keep correctAnswer)
+      while (fixed.options.length < 4) fixed.options.push(`Option ${String.fromCharCode(65 + fixed.options.length)}`);
       if (fixed.options.length > 4) {
-        const correctIdx = fixed.options.indexOf(fixed.correctAnswer);
+        const idx  = fixed.options.indexOf(fixed.correctAnswer);
         const kept = fixed.options.slice(0, 4);
-        if (correctIdx >= 4) {
-          kept[3] = fixed.correctAnswer;
-        }
+        if (idx >= 4 && fixed.correctAnswer) kept[3] = fixed.correctAnswer;
         fixed.options = kept;
       }
+      if (fixed.correctAnswer && !fixed.options.includes(fixed.correctAnswer)) fixed.options[3] = fixed.correctAnswer;
+    }
 
-      // Final safety: correctAnswer must be in the final options array
-      if (!fixed.options.includes(fixed.correctAnswer)) {
-        fixed.options[3] = fixed.correctAnswer;
+    // True/False — normalize only, never guess
+    if (fixed.type === 'true-false') {
+      fixed.options = ['True', 'False'];
+      if (fixed.correctAnswer) {
+        const lower = fixed.correctAnswer.toLowerCase().trim();
+        if (['true', 't', 'yes'].includes(lower))        fixed.correctAnswer = 'True';
+        else if (['false', 'f', 'no'].includes(lower))   fixed.correctAnswer = 'False';
       }
     }
 
-    // ── True/False repairs ──
-    if (fixed.type === 'true-false') {
-      fixed.options = ['True', 'False'];
-      const lower = (fixed.correctAnswer || '').toLowerCase().trim();
-      fixed.correctAnswer = lower === 'true' || lower === 't' ? 'True' : 'False';
-    }
+    if (fixed.type === 'short-answer') fixed.options = [] as any;
 
-    // ── Short-answer repairs ──
-    if (fixed.type === 'short-answer') {
-      // Strip any stray options Gemini included
-      fixed.options = [] as any;
-    }
-
-    // ── Ensure explanation exists ──
-    if (!fixed.explanation) {
-      fixed.explanation = 'No explanation provided.';
+    if (!fixed.explanation?.trim()) {
+      fixed.explanation = fixed.correctAnswer
+        ? `The correct answer is "${fixed.correctAnswer}".`
+        : 'No explanation provided.';
     }
 
     return fixed;
   });
 
-  // ── Only filter questions missing absolutely critical fields ──
-  const valid = repaired.filter(q => {
-    if (!q.question?.trim()) {
-      console.warn(`[quiz-repair] Dropping Q${q.id}: no question text`);
-      return false;
-    }
+  const valid = repaired.filter(q => Boolean(q.question?.trim()));
+
+  valid.forEach(q => {
     if (!q.correctAnswer?.trim()) {
-      console.warn(`[quiz-repair] Dropping Q${q.id}: no correctAnswer`);
-      return false;
+      q.correctAnswer    = '(answer unavailable)';
+      q.explanation      = 'The AI did not provide an answer for this question.';
+      (q as any)._unreliable = true;
     }
-    return true;
   });
 
-  // Re-index after any drops
   valid.forEach((q, i) => { q.id = i; });
 
-  // Log shortfall for debugging (but never throw)
-  if (valid.length < requestedCount) {
+  const reliableCount = valid.filter(q => !(q as any)._unreliable).length;
+  const ratio         = reliableCount / requestedCount;
+  const isHealthy     = reliableCount >= QUIZ_CACHE_MIN_ABSOLUTE && ratio >= QUIZ_CACHE_HEALTH_RATIO;
+
+  if (valid.length < requestedCount || reliableCount < valid.length) {
     console.warn(
-      `[quiz-repair] Requested ${requestedCount} questions, ` +
-      `got ${valid.length} after validation`
+      `[quiz-repair] Requested ${requestedCount}, got ${valid.length} (${reliableCount} reliable) — ${isHealthy ? 'HEALTHY' : 'UNHEALTHY'}`
     );
   }
 
-  return valid;
+  return { questions: valid, isHealthy };
 }
 
-// ============ SECTION CONTENT EXTRACTION ============
+function validateCachedQuiz(questions: QuizQuestion[], requestedCount: number): { isHealthy: boolean } {
+  if (!Array.isArray(questions)) return { isHealthy: false };
+  const reliable = questions.filter(q =>
+    q.question?.trim() && q.correctAnswer?.trim() &&
+    q.correctAnswer !== '(answer unavailable)' && !(q as any)._unreliable
+  ).length;
+  return { isHealthy: reliable >= QUIZ_CACHE_MIN_ABSOLUTE && (reliable / requestedCount) >= QUIZ_CACHE_HEALTH_RATIO };
+}
 
-function extractSectionContent(
-  fullText: string,
-  sectionTitle: string,
-  allSections: string[]
-): string {
-  const lowerText  = fullText.toLowerCase();
-  const lowerTitle = sectionTitle.toLowerCase();
+// ============ SECTION RECALL VALIDATION ============
 
-  let startIndex = lowerText.indexOf(lowerTitle);
+function isSectionRecallHealthy(recall: SectionRecall): boolean {
+  let count = 0;
+  if (recall.concepts?.length)         count++;
+  if (recall.definitions?.length)      count++;
+  if (recall.processes?.length)        count++;
+  if (recall.examples?.length)         count++;
+  if (recall.comparisons?.length)      count++;
+  if (recall.applications?.length)     count++;
+  if (recall.criticalThinking?.length) count++;
+  return count >= SECTION_CACHE_MIN_ITEMS;
+}
 
-  if (startIndex === -1) {
-    const words = lowerTitle.split(' ').filter(w => w.length > 3);
-    for (const word of words) {
-      const idx = lowerText.indexOf(word);
-      if (idx !== -1) { startIndex = idx; break; }
-    }
+function countSectionRecallItems(recall: SectionRecall): number {
+  return (
+    (recall.concepts?.length         || 0) + (recall.definitions?.length  || 0) +
+    (recall.processes?.length        || 0) + (recall.examples?.length     || 0) +
+    (recall.comparisons?.length      || 0) + (recall.applications?.length || 0) +
+    (recall.criticalThinking?.length || 0)
+  );
+}
+
+// ============ COVERAGE CALCULATION ============
+
+function calculateCoverage(
+  sectionRecalls: SectionRecall[],
+  bigPicture: BigPictureResponse,
+  summary: SimplifiedSummary,
+  totalSections: number
+): CoverageMetrics {
+  let questionsGenerated = 0;
+  let conceptsCovered    = 0;
+
+  const bp = bigPicture.bigPictureRecall;
+  if (bp) {
+    questionsGenerated +=
+      (bp.mainIdeas?.length || 0) + (bp.coreThemes?.length || 0) +
+      (bp.purposeAndStructure?.length || 0) + (bp.sectionRelationships?.length || 0) +
+      (bp.summaryQuestions?.length || 0);
+  }
+  questionsGenerated += (bigPicture.crossSectionConnections?.length || 0);
+  questionsGenerated += (bigPicture.finalReviewQuestions?.length    || 0);
+
+  for (const s of sectionRecalls) {
+    conceptsCovered    += (s.concepts?.length || 0);
+    questionsGenerated +=
+      (s.definitions?.length || 0) + (s.processes?.length   || 0) +
+      (s.examples?.length    || 0) + (s.comparisons?.length || 0) +
+      (s.applications?.length || 0) + (s.criticalThinking?.length || 0);
   }
 
-  if (startIndex === -1) {
-    const sectionIndex = allSections.indexOf(sectionTitle);
-    const chunkSize    = Math.floor(fullText.length / Math.max(allSections.length, 1));
-    return fullText.substring(
-      sectionIndex * chunkSize,
-      (sectionIndex + 1) * chunkSize + 300
-    );
-  }
+  if (summary?.glossary) conceptsCovered += summary.glossary.length;
 
-  let endIndex = fullText.length;
-  const currentSectionIndex = allSections.indexOf(sectionTitle);
+  const avgQPerSection    = sectionRecalls.length > 0
+    ? Math.round(questionsGenerated / Math.max(sectionRecalls.length, 1))
+    : 7;
+  const remainingSections = Math.max(0, totalSections - sectionRecalls.length);
+  const expectedQuestions = questionsGenerated + (remainingSections * avgQPerSection);
 
-  for (let i = currentSectionIndex + 1; i < allSections.length; i++) {
-    const nextSection = allSections[i].toLowerCase();
-    const nextIdx     = lowerText.indexOf(nextSection, startIndex + lowerTitle.length);
-    if (nextIdx !== -1 && nextIdx < endIndex) {
-      endIndex = nextIdx;
-      break;
-    }
-  }
+  return {
+    sectionsIdentified: totalSections,
+    sectionsLoaded:     sectionRecalls.length,
+    questionsGenerated,
+    conceptsCovered,
+    expectedQuestions,
+  };
+}
 
-  return fullText.substring(startIndex, Math.min(endIndex, startIndex + INPUT_LIMITS.section));
+export function computeCoverageFromResult(
+  result: RecallResult,
+  loadedSections: SectionRecall[]
+): CoverageMetrics {
+  return calculateCoverage(
+    loadedSections,
+    {
+      bigPictureRecall:        result.bigPictureRecall,
+      crossSectionConnections: result.crossSectionConnections || [],
+      finalReviewQuestions:    result.finalReviewQuestions    || [],
+    },
+    result.simplifiedSummary,
+    result.documentStructure?.length || 0
+  );
 }
 
 // ============ MAIN EXPORT FUNCTIONS ============
 
+/**
+ * Generates recall content: summary (Call 1) + big picture (Call 2).
+ *
+ * STRUCTURAL FALLBACK CHAIN (after Call 1):
+ *
+ *   Level 1 — documentStructure is populated normally → proceed to Call 2
+ *
+ *   Level 2 — documentStructure is empty BUT simplifiedSummary.sections
+ *             has headings → recover section titles from headings,
+ *             proceed to Call 2 with recovered titles
+ *
+ *   Level 3 — Both documentStructure AND sections are empty → document
+ *             is too sparse/illegible. Skip Call 2 entirely, return
+ *             partial result (not cached so retry gets a fresh attempt).
+ *
+ * This prevents "Document sections: " being sent to Gemini (Level 3),
+ * while maximizing recovery for borderline documents (Level 2).
+ */
 export async function generateRecallContent(apiKey: string, text: string): Promise<RecallResult> {
   const maxChars      = 25000;
   const truncatedText = text.length > maxChars
@@ -1041,32 +1135,111 @@ export async function generateRecallContent(apiKey: string, text: string): Promi
   return deduplicatedRequest<RecallResult>(cacheKey, async () => {
     const cached = await getCached<RecallResult>(cacheKey);
     if (cached) {
-      console.log('[generateRecallContent] Cache hit — skipping API call');
-      return cached;
+      if (cached.simplifiedSummary && cached.bigPictureRecall) {
+        console.log('[generateRecallContent] Cache hit');
+        return cached;
+      }
+      console.warn('[generateRecallContent] Incomplete cache — evicting');
+      await deleteCache(cacheKey);
     }
 
-    console.log('Generating summary + big picture recall (merged call)…');
-    let merged: MergedResponse;
+    // ── Call 1: Summary ──
+    console.log('Call 1: Generating summary…');
+    let summaryData: SummaryResponse;
 
     try {
-      merged = await callGeminiWithRetry<MergedResponse>(
-        apiKey,
-        buildMergedSummaryBigPictureRequest(truncatedText)
-      );
+      const rawSummary = await callGeminiWithRetry<any>(apiKey, buildSummaryRequest(truncatedText));
+      summaryData = unwrapSummary(rawSummary);
     } catch (err: any) {
-      console.error('Merged call failed:', err.message);
-      throw new Error(`Failed to generate content: ${err.message}`);
+      console.error('Summary call failed:', err.message);
+      throw new Error(`Failed to generate summary: ${err.message}`);
+    }
+
+    let documentStructure = summaryData.documentStructure;
+
+    // ── LEVEL 2 FALLBACK: Recover from simplifiedSummary.sections ──
+    //
+    // If documentStructure is empty but the simplified summary has
+    // sections with headings, extract those headings as section titles.
+    // This handles documents where Gemini populated sections correctly
+    // but failed to mirror them into documentStructure.
+    if (documentStructure.length < MIN_SECTIONS_FOR_BIGPICTURE) {
+      const inferredSections = (summaryData.simplifiedSummary?.sections ?? [])
+        .map(s => s.heading?.trim())
+        .filter((h): h is string => typeof h === 'string' && h.length > 2);
+
+      if (inferredSections.length >= MIN_SECTIONS_FOR_BIGPICTURE) {
+        console.warn(
+          `[generateRecallContent] documentStructure was empty — ` +
+          `recovered ${inferredSections.length} section titles from simplifiedSummary.sections`
+        );
+        documentStructure = inferredSections;
+        // Patch the summaryData so the result is consistent
+        summaryData = { ...summaryData, documentStructure: inferredSections };
+      }
+    }
+
+    // ── LEVEL 3 FALLBACK: Both sources empty — document too sparse ──
+    if (documentStructure.length < MIN_SECTIONS_FOR_BIGPICTURE) {
+      console.warn(
+        `[generateRecallContent] documentStructure is empty AND no section headings found. ` +
+        `Document may be too sparse or illegible. ` +
+        `Skipping big picture call. Returning partial result (not cached).`
+      );
+
+      // Return partial result — intentionally NOT cached so a retry
+      // attempts fresh generation rather than serving this empty result.
+      return {
+        documentOverview:        summaryData.documentOverview || '',
+        documentStructure:       [],
+        simplifiedSummary:       summaryData.simplifiedSummary,
+        bigPictureRecall:        createEmptyBigPictureRecall(),
+        sectionRecalls:          [],
+        crossSectionConnections: [],
+        finalReviewQuestions:    [],
+        totalCoverage:           calculateCoverage(
+          [],
+          { bigPictureRecall: createEmptyBigPictureRecall(), crossSectionConnections: [], finalReviewQuestions: [] },
+          summaryData.simplifiedSummary,
+          0
+        ),
+      };
+    }
+
+    // ── Call 2: Big Picture Recall ──
+    console.log(`Call 2: Generating big picture recall (${documentStructure.length} sections)…`);
+    let bigPictureData: BigPictureResponse;
+
+    try {
+      await sleep(500);
+      const rawBigPicture = await callGeminiWithRetry<any>(
+        apiKey,
+        buildBigPictureRequest(truncatedText, documentStructure)
+      );
+      bigPictureData = unwrapBigPicture(rawBigPicture);
+    } catch (err: any) {
+      console.warn('Big picture call failed:', err.message, '— returning partial result');
+      bigPictureData = {
+        bigPictureRecall:        createEmptyBigPictureRecall(),
+        crossSectionConnections: [],
+        finalReviewQuestions:    [],
+      };
     }
 
     const result: RecallResult = {
-      documentOverview:        merged.documentOverview,
-      documentStructure:       merged.documentStructure || [],
-      simplifiedSummary:       merged.simplifiedSummary,
-      bigPictureRecall:        merged.bigPictureRecall || createEmptyBigPictureRecall(),
+      documentOverview:        summaryData.documentOverview        || '',
+      documentStructure,
+      simplifiedSummary:       summaryData.simplifiedSummary,
+      bigPictureRecall:        bigPictureData.bigPictureRecall     || createEmptyBigPictureRecall(),
       sectionRecalls:          [],
-      crossSectionConnections: merged.crossSectionConnections || [],
-      finalReviewQuestions:    merged.finalReviewQuestions    || [],
-      totalCoverage:           calculateCoverage([], merged)
+      crossSectionConnections: bigPictureData.crossSectionConnections || [],
+      finalReviewQuestions:    bigPictureData.finalReviewQuestions    || [],
+      totalCoverage:           calculateCoverage(
+        [],
+        bigPictureData,
+        summaryData.simplifiedSummary,
+        documentStructure.length
+      ),
     };
 
     await setCache(cacheKey, result);
@@ -1081,9 +1254,7 @@ export async function generateSectionRecall(
   allSections: string[]
 ): Promise<SectionRecall> {
   const maxChars      = 25000;
-  const truncatedText = fullText.length > maxChars
-    ? fullText.substring(0, maxChars)
-    : fullText;
+  const truncatedText = fullText.length > maxChars ? fullText.substring(0, maxChars) : fullText;
 
   const sectionHash  = await sha256(normalizeTextForHashing(sectionTitle));
   const sectionShort = sectionHash.substring(0, 12);
@@ -1092,22 +1263,37 @@ export async function generateSectionRecall(
   return deduplicatedRequest<SectionRecall>(cacheKey, () =>
     enqueueSectionRequest(async () => {
       const cached = await getCached<SectionRecall>(cacheKey);
-      if (cached) {
+      if (cached && isSectionRecallHealthy(cached)) {
         console.log(`[generateSectionRecall] Cache hit for "${sectionTitle}"`);
         return cached;
       }
+      if (cached) {
+        console.warn(`[generateSectionRecall] Unhealthy cache for "${sectionTitle}" — evicting`);
+        await deleteCache(cacheKey);
+      }
 
-      console.log(`Generating recall for section "${sectionTitle}"…`);
+      console.log(`Generating recall for "${sectionTitle}"…`);
 
       try {
-        const sectionContent  = extractSectionContent(truncatedText, sectionTitle, allSections);
-        const response        = await callGeminiWithRetry<SectionRecallResponse>(
+        const sectionContent = extractSectionContent(truncatedText, sectionTitle, allSections);
+        console.log(`[extractSection] ${sectionContent.length} chars for "${sectionTitle}"`);
+
+        if (sectionContent.length < 50) {
+          console.warn(`[generateSectionRecall] Content too short — skipping API call`);
+          return createEmptySectionRecall(sectionTitle);
+        }
+
+        const rawResponse   = await callGeminiWithRetry<any>(
           apiKey,
           buildSectionRecallRequest(sectionTitle, sectionContent)
         );
+        const sectionRecall = unwrapSectionRecall(rawResponse, sectionTitle);
+        const itemCount     = countSectionRecallItems(sectionRecall);
+        const healthy       = isSectionRecallHealthy(sectionRecall);
 
-        const sectionRecall = response.sectionRecall || createEmptySectionRecall(sectionTitle);
-        await setCache(cacheKey, sectionRecall);
+        console.log(`[sectionRecall] "${sectionTitle}": ${itemCount} items — ${healthy ? 'HEALTHY' : 'UNHEALTHY'}`);
+
+        if (healthy) await setCache(cacheKey, sectionRecall);
         return sectionRecall;
 
       } catch (err: any) {
@@ -1135,8 +1321,10 @@ export async function generateQuiz(
   return deduplicatedRequest<QuizQuestion[]>(cacheKey, async () => {
     const cached = await getCached<QuizQuestion[]>(cacheKey);
     if (cached) {
-      console.log('[generateQuiz] Cache hit — skipping API call');
-      return cached;
+      const { isHealthy } = validateCachedQuiz(cached, safeNum);
+      if (isHealthy) { console.log('[generateQuiz] Cache hit (healthy)'); return cached; }
+      console.warn('[generateQuiz] Unhealthy cache — evicting');
+      await deleteCache(cacheKey);
     }
 
     const response = await callGeminiWithRetry<QuizResponse>(
@@ -1144,22 +1332,25 @@ export async function generateQuiz(
       buildQuizRequest(truncatedText, questionType, safeNum)
     );
 
-    const questions = validateAndRepairQuiz(response.questions || [], safeNum);
+    const { questions, isHealthy } = validateAndRepairQuiz(response.questions || [], safeNum);
 
-    await setCache(cacheKey, questions);
+    if (isHealthy) {
+      await setCache(cacheKey, questions);
+      console.log(`[generateQuiz] Cached ${questions.length} questions`);
+    } else {
+      console.warn(`[generateQuiz] NOT caching — ${questions.length}/${safeNum} reliable`);
+    }
+
     return questions;
   });
 }
 
-// ============ HELPER FUNCTIONS ============
+// ============ HELPERS ============
 
 function createEmptyBigPictureRecall(): BigPictureRecall {
   return {
-    mainIdeas:            [],
-    coreThemes:           [],
-    purposeAndStructure:  [],
-    sectionRelationships: [],
-    summaryQuestions:     []
+    mainIdeas: [], coreThemes: [], purposeAndStructure: [],
+    sectionRelationships: [], summaryQuestions: []
   };
 }
 
@@ -1167,54 +1358,7 @@ function createEmptySectionRecall(sectionTitle: string): SectionRecall {
   return {
     sectionTitle,
     sectionSummary:   'Unable to generate recall for this section.',
-    concepts:         [],
-    definitions:      [],
-    processes:        [],
-    examples:         [],
-    comparisons:      [],
-    applications:     [],
-    criticalThinking: []
-  };
-}
-
-function calculateCoverage(
-  sectionRecalls: SectionRecall[],
-  merged: MergedResponse
-): { sectionsIdentified: number; questionsGenerated: number; conceptsCovered: number } {
-  let totalQuestions = 0;
-  let totalConcepts  = 0;
-
-  const bp = merged.bigPictureRecall;
-  if (bp) {
-    totalQuestions +=
-      (bp.mainIdeas?.length            || 0) +
-      (bp.coreThemes?.length           || 0) +
-      (bp.purposeAndStructure?.length  || 0) +
-      (bp.sectionRelationships?.length || 0) +
-      (bp.summaryQuestions?.length     || 0);
-  }
-
-  for (const section of sectionRecalls) {
-    totalConcepts  += (section.concepts?.length          || 0);
-    totalQuestions +=
-      (section.definitions?.length      || 0) +
-      (section.processes?.length        || 0) +
-      (section.examples?.length         || 0) +
-      (section.comparisons?.length      || 0) +
-      (section.applications?.length     || 0) +
-      (section.criticalThinking?.length || 0);
-  }
-
-  totalQuestions +=
-    (merged.crossSectionConnections?.length || 0) +
-    (merged.finalReviewQuestions?.length    || 0);
-
-  const summary = merged.simplifiedSummary;
-  if (summary?.glossary) totalConcepts += summary.glossary.length;
-
-  return {
-    sectionsIdentified: merged.documentStructure?.length || 0,
-    questionsGenerated: totalQuestions,
-    conceptsCovered:    totalConcepts
+    concepts: [], definitions: [], processes: [], examples: [],
+    comparisons: [], applications: [], criticalThinking: []
   };
 }

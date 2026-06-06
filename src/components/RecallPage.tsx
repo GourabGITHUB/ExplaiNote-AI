@@ -1,7 +1,7 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import ApiKeyInput from './ApiKeyInput';
 import DictionaryTooltip from './DictionaryTooltip';
-import { generateRecallContent } from '../services/ai';
+import { generateSectionRecall, generateRecallContent } from '../services/ai';
 import { createProjectFromText, updateProjectStatus, type Project } from '../services/db';
 import { resolveApiKey } from '../services/apiKey';
 import type { RecallResult, FlashCard, KeyConcept, SectionRecall, SimplifiedSection } from '../types';
@@ -188,12 +188,16 @@ function SectionRecallBlock({
   revealedCards: Set<number>;
   onToggle: (index: number) => void;
 }) {
-  let currentIndex = globalIndexStart;
-  
-  const renderFlashcards = (cards: FlashCard[] | undefined, categoryTitle: string, categoryIcon: string) => {
+  // Compute sub-offsets explicitly rather than mutating a single index via rendering loops
+  const offsetDefinitions = globalIndexStart;
+  const offsetProcesses = offsetDefinitions + (section.definitions?.length || 0);
+  const offsetExamples = offsetProcesses + (section.processes?.length || 0);
+  const offsetComparisons = offsetExamples + (section.examples?.length || 0);
+  const offsetApplications = offsetComparisons + (section.comparisons?.length || 0);
+  const offsetCriticalThinking = offsetApplications + (section.applications?.length || 0);
+
+  const renderFlashcards = (cards: FlashCard[] | undefined, categoryTitle: string, categoryIcon: string, startIdx: number) => {
     if (!cards || cards.length === 0) return null;
-    const startIdx = currentIndex;
-    currentIndex += cards.length;
     
     return (
       <div className="category-block">
@@ -252,12 +256,12 @@ function SectionRecallBlock({
         </div>
       )}
       
-      {renderFlashcards(section.definitions, 'Definitions', '📖')}
-      {renderFlashcards(section.processes, 'Processes & Steps', '⚙️')}
-      {renderFlashcards(section.examples, 'Examples', '💡')}
-      {renderFlashcards(section.comparisons, 'Comparisons', '⚖️')}
-      {renderFlashcards(section.applications, 'Applications', '🎯')}
-      {renderFlashcards(section.criticalThinking, 'Critical Thinking', '🧠')}
+      {renderFlashcards(section.definitions, 'Definitions', '📖', offsetDefinitions)}
+      {renderFlashcards(section.processes, 'Processes & Steps', '⚙️', offsetProcesses)}
+      {renderFlashcards(section.examples, 'Examples', '💡', offsetExamples)}
+      {renderFlashcards(section.comparisons, 'Comparisons', '⚖️', offsetComparisons)}
+      {renderFlashcards(section.applications, 'Applications', '🎯', offsetApplications)}
+      {renderFlashcards(section.criticalThinking, 'Critical Thinking', '🧠', offsetCriticalThinking)}
     </CollapsibleSection>
   );
 }
@@ -270,6 +274,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
   const [revealedCards, setRevealedCards] = useState<Set<number>>(new Set());
   const [activeTab, setActiveTab] = useState<'summary' | 'bigpicture' | 'sections' | 'review'>('summary');
   const [loadedProjectId, setLoadedProjectId] = useState<string | null>(null);
+  
   const pageRef = useRef<HTMLDivElement>(null);
 
   // Load text from a selected project
@@ -287,11 +292,38 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
     }
   }, [activeProject, loadedProjectId]);
 
+  // Compute total question layouts safely via useMemo to decouple reveal loops
+  const totalQuestionsCount = useMemo(() => {
+    if (!result) return 0;
+    let count = 0;
+    
+    const bp = result.bigPictureRecall;
+    if (bp) {
+      count += (bp.mainIdeas?.length || 0) +
+               (bp.coreThemes?.length || 0) +
+               (bp.purposeAndStructure?.length || 0) +
+               (bp.sectionRelationships?.length || 0) +
+               (bp.summaryQuestions?.length || 0);
+    }
+    
+    if (result.sectionRecalls) {
+      for (const section of result.sectionRecalls) {
+        count += (section.definitions?.length || 0) +
+                 (section.processes?.length || 0) +
+                 (section.examples?.length || 0) +
+                 (section.comparisons?.length || 0) +
+                 (section.applications?.length || 0) +
+                 (section.criticalThinking?.length || 0);
+      }
+    }
+    
+    count += (result.crossSectionConnections?.length || 0);
+    count += (result.finalReviewQuestions?.length || 0);
+    return count;
+  }, [result]);
+
   const handleGenerate = async () => {
     const effectiveKey = resolveApiKey(apiKey);
-    
-    // 1. Removed the blocking "No API key available" check.
-    // The underlying ai.ts service will now gracefully route to /api/proxy if effectiveKey is empty.
 
     if (text.trim().length < 50) {
       setError('Please enter at least 50 characters of text for meaningful analysis.');
@@ -306,22 +338,45 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
     let projectId: string | null = null;
 
     try {
-      // Create project entry
       const project = await createProjectFromText(text);
       projectId = project.id;
       await updateProjectStatus(projectId, 'processing');
       onProjectUpdate?.();
 
-      // 2. This safely passes the effectiveKey (which might be "") right along to generateRecallContent
+      // 1. Core structural processing (Call 1 & Call 2)
       const data = await generateRecallContent(effectiveKey, text);
       setResult(data);
 
-      // Update project status to ready
+      // 2. Sequential processing for individual sections (Call 3+)
+      if (data.documentStructure && data.documentStructure.length > 0) {
+        const populatedSections: SectionRecall[] = [];
+        
+        for (const sectionTitle of data.documentStructure) {
+          try {
+            const sectionData = await generateSectionRecall(
+              effectiveKey,
+              text,
+              sectionTitle,
+              data.documentStructure
+            );
+            populatedSections.push(sectionData);
+            
+            // Update state progressively so users don't wait indefinitely
+            setResult(prev => prev ? {
+              ...prev,
+              sectionRecalls: [...populatedSections]
+            } : null);
+            
+          } catch (secErr) {
+            console.error(`Failed loading section: ${sectionTitle}`, secErr);
+          }
+        }
+      }
+
       await updateProjectStatus(projectId, 'ready');
       onProjectUpdate?.();
     } catch (err: any) {
       setError(err.message || 'Failed to generate recall content. Please try again.');
-      // Update project status to error
       if (projectId) {
         await updateProjectStatus(projectId, 'error');
         onProjectUpdate?.();
@@ -353,40 +408,10 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
   };
 
   const revealAll = () => {
-    if (!result) return;
     const allIndices = new Set<number>();
-    let idx = 0;
-    
-    // Big picture
-    const bp = result.bigPictureRecall;
-    if (bp) {
-      idx += (bp.mainIdeas?.length || 0);
-      idx += (bp.coreThemes?.length || 0);
-      idx += (bp.purposeAndStructure?.length || 0);
-      idx += (bp.sectionRelationships?.length || 0);
-      idx += (bp.summaryQuestions?.length || 0);
-    }
-    
-    // Sections
-    if (result.sectionRecalls) {
-      for (const section of result.sectionRecalls) {
-        idx += (section.definitions?.length || 0);
-        idx += (section.processes?.length || 0);
-        idx += (section.examples?.length || 0);
-        idx += (section.comparisons?.length || 0);
-        idx += (section.applications?.length || 0);
-        idx += (section.criticalThinking?.length || 0);
-      }
-    }
-    
-    // Cross-section and final
-    idx += (result.crossSectionConnections?.length || 0);
-    idx += (result.finalReviewQuestions?.length || 0);
-    
-    for (let i = 0; i < idx; i++) {
+    for (let i = 0; i < totalQuestionsCount; i++) {
       allIndices.add(i);
     }
-    
     setRevealedCards(allIndices);
   };
 
@@ -394,38 +419,30 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
     setRevealedCards(new Set());
   };
 
-  // Calculate global index for flashcards
-  const getGlobalIndexForBigPicture = () => {
-    return 0;
-  };
-
   const getGlobalIndexForSection = (sectionIndex: number) => {
     if (!result) return 0;
     let idx = 0;
     
-    // Count big picture questions
     const bp = result.bigPictureRecall;
     if (bp) {
-      idx += (bp.mainIdeas?.length || 0);
-      idx += (bp.coreThemes?.length || 0);
-      idx += (bp.purposeAndStructure?.length || 0);
-      idx += (bp.sectionRelationships?.length || 0);
-      idx += (bp.summaryQuestions?.length || 0);
+      idx += (bp.mainIdeas?.length || 0) +
+             (bp.coreThemes?.length || 0) +
+             (bp.purposeAndStructure?.length || 0) +
+             (bp.sectionRelationships?.length || 0) +
+             (bp.summaryQuestions?.length || 0);
     }
     
-    // Count previous sections
     for (let i = 0; i < sectionIndex; i++) {
       const section = result.sectionRecalls[i];
       if (section) {
-        idx += (section.definitions?.length || 0);
-        idx += (section.processes?.length || 0);
-        idx += (section.examples?.length || 0);
-        idx += (section.comparisons?.length || 0);
-        idx += (section.applications?.length || 0);
-        idx += (section.criticalThinking?.length || 0);
+        idx += (section.definitions?.length || 0) +
+               (section.processes?.length || 0) +
+               (section.examples?.length || 0) +
+               (section.comparisons?.length || 0) +
+               (section.applications?.length || 0) +
+               (section.criticalThinking?.length || 0);
       }
     }
-    
     return idx;
   };
 
@@ -433,28 +450,25 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
     if (!result) return 0;
     let idx = 0;
     
-    // Count big picture
     const bp = result.bigPictureRecall;
     if (bp) {
-      idx += (bp.mainIdeas?.length || 0);
-      idx += (bp.coreThemes?.length || 0);
-      idx += (bp.purposeAndStructure?.length || 0);
-      idx += (bp.sectionRelationships?.length || 0);
-      idx += (bp.summaryQuestions?.length || 0);
+      idx += (bp.mainIdeas?.length || 0) +
+             (bp.coreThemes?.length || 0) +
+             (bp.purposeAndStructure?.length || 0) +
+             (bp.sectionRelationships?.length || 0) +
+             (bp.summaryQuestions?.length || 0);
     }
     
-    // Count all sections
     if (result.sectionRecalls) {
       for (const section of result.sectionRecalls) {
-        idx += (section.definitions?.length || 0);
-        idx += (section.processes?.length || 0);
-        idx += (section.examples?.length || 0);
-        idx += (section.comparisons?.length || 0);
-        idx += (section.applications?.length || 0);
-        idx += (section.criticalThinking?.length || 0);
+        idx += (section.definitions?.length || 0) +
+               (section.processes?.length || 0) +
+               (section.examples?.length || 0) +
+               (section.comparisons?.length || 0) +
+               (section.applications?.length || 0) +
+               (section.criticalThinking?.length || 0);
       }
     }
-    
     return idx;
   };
 
@@ -501,7 +515,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
         Double-click any word to see its definition
       </div>
 
-      <ApiKeyInput apiKey={apiKey} onApiKeyChange={onApiKeyChange} />
+            <ApiKeyInput apiKey={apiKey} onApiKeyChange={onApiKeyChange} />
 
       {!result && (
         <>
@@ -534,7 +548,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
       )}
 
       {error && (
-        <div className="error-msg">
+        <div className="error-msg" >
           <span>⚠️</span> {error}
         </div>
       )}
@@ -572,7 +586,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
                 📑 {result.totalCoverage?.sectionsIdentified || result.sectionRecalls?.length || 0} Sections
               </span>
               <span className="stat-pill">
-                ❓ {result.totalCoverage?.questionsGenerated || 0} Questions
+                ❓ {result.totalCoverage?.questionsGenerated || totalQuestionsCount || 0} Questions
               </span>
               <span className="stat-pill">
                 💡 {result.totalCoverage?.conceptsCovered || 0} Concepts
@@ -622,13 +636,11 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
           {/* Simplified Summary Tab */}
           {activeTab === 'summary' && result.simplifiedSummary && (
             <div className="tab-content">
-              {/* Hero Summary Card */}
               <div className="summary-hero-card">
                 <h2 className="summary-title">{result.simplifiedSummary.title}</h2>
                 <p className="one-liner">{result.simplifiedSummary.oneLinerSummary}</p>
               </div>
 
-              {/* Why It Matters */}
               <div className="why-matters-card">
                 <div className="why-matters-icon">🎯</div>
                 <div>
@@ -637,12 +649,10 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
                 </div>
               </div>
 
-              {/* Core Idea */}
               <CollapsibleSection title="The Core Idea" icon="💡" defaultOpen={true} className="core-idea-section">
                 <p className="core-idea-text">{result.simplifiedSummary.coreIdea}</p>
               </CollapsibleSection>
 
-              {/* Section-by-Section Simplified Explanations */}
               {result.simplifiedSummary.sections && result.simplifiedSummary.sections.length > 0 && (
                 <CollapsibleSection 
                   title="Explained Simply" 
@@ -658,7 +668,6 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
                 </CollapsibleSection>
               )}
 
-              {/* Key Takeaways */}
               {result.simplifiedSummary.keyTakeaways && result.simplifiedSummary.keyTakeaways.length > 0 && (
                 <CollapsibleSection title="Key Takeaways" icon="🏆" defaultOpen={true}>
                   <div className="takeaways-list">
@@ -672,7 +681,6 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
                 </CollapsibleSection>
               )}
 
-              {/* Quick Recap */}
               {result.simplifiedSummary.quickRecap && (
                 <div className="quick-recap-card">
                   <div className="quick-recap-header">
@@ -683,7 +691,6 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
                 </div>
               )}
 
-              {/* Glossary */}
               {result.simplifiedSummary.glossary && result.simplifiedSummary.glossary.length > 0 && (
                 <CollapsibleSection 
                   title="Glossary" 
@@ -707,7 +714,6 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
           {/* Big Picture Tab */}
           {activeTab === 'bigpicture' && result.bigPictureRecall && (
             <div className="tab-content">
-              {/* Document Overview */}
               <CollapsibleSection title="Document Overview" icon="📋" defaultOpen={true}>
                 <p className="overview-text">{result.documentOverview}</p>
                 {result.documentStructure && result.documentStructure.length > 0 && (
@@ -723,7 +729,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
               </CollapsibleSection>
 
               {(() => {
-                let idx = getGlobalIndexForBigPicture();
+                let idx = 0;
                 const bp = result.bigPictureRecall;
                 
                 const mainIdeasStart = idx;
@@ -754,56 +760,72 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
           )}
 
           {/* Sections Tab */}
-          {activeTab === 'sections' && result.sectionRecalls && (
+          {activeTab === 'sections' && (
             <div className="tab-content">
-              {result.sectionRecalls.map((section, i) => (
-                <SectionRecallBlock
-                  key={i}
-                  section={section}
-                  sectionIndex={i}
-                  globalIndexStart={getGlobalIndexForSection(i)}
-                  revealedCards={revealedCards}
-                  onToggle={toggleCard}
-                />
-              ))}
+              {!result.sectionRecalls || result.sectionRecalls.length === 0 ? (
+                <div className="empty-section-notice" style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                  <span className="spinner" style={{ display: 'inline-block', marginBottom: '8px' }} />
+                  <p>Streaming granular section details. Please hold on...</p>
+                </div>
+              ) : (
+                result.sectionRecalls.map((section, i) => (
+                  <SectionRecallBlock
+                    key={i}
+                    section={section}
+                    sectionIndex={i}
+                    globalIndexStart={getGlobalIndexForSection(i)}
+                    revealedCards={revealedCards}
+                    onToggle={toggleCard}
+                  />
+                ))
+              )}
             </div>
           )}
 
           {/* Review Tab */}
           {activeTab === 'review' && (
             <div className="tab-content">
-              {result.crossSectionConnections && result.crossSectionConnections.length > 0 && (
-                <CollapsibleSection title="Cross-Section Connections" icon="🔗" defaultOpen={true}>
-                  <div className="flashcard-grid">
-                    {result.crossSectionConnections.map((card, i) => (
-                      <FlashCardItem
-                        key={i}
-                        card={card}
-                        index={i}
-                        globalIndex={getGlobalIndexForReview() + i}
-                        revealedCards={revealedCards}
-                        onToggle={toggleCard}
-                      />
-                    ))}
-                  </div>
-                </CollapsibleSection>
-              )}
+              {(!result.crossSectionConnections || result.crossSectionConnections.length === 0) && 
+               (!result.finalReviewQuestions || result.finalReviewQuestions.length === 0) ? (
+                <div className="empty-section-notice" style={{ padding: '24px', textAlign: 'center', color: 'var(--text-muted)' }}>
+                  <p>💡 No review questions or cross-section linkages were found for this compilation block.</p>
+                </div>
+              ) : (
+                <>
+                  {result.crossSectionConnections && result.crossSectionConnections.length > 0 && (
+                    <CollapsibleSection title="Cross-Section Connections" icon="🔗" defaultOpen={true}>
+                      <div className="flashcard-grid">
+                        {result.crossSectionConnections.map((card, i) => (
+                          <FlashCardItem
+                            key={i}
+                            card={card}
+                            index={i}
+                            globalIndex={getGlobalIndexForReview() + i}
+                            revealedCards={revealedCards}
+                            onToggle={toggleCard}
+                          />
+                        ))}
+                      </div>
+                    </CollapsibleSection>
+                  )}
 
-              {result.finalReviewQuestions && result.finalReviewQuestions.length > 0 && (
-                <CollapsibleSection title="Final Review Questions" icon="🏁" defaultOpen={true}>
-                  <div className="flashcard-grid">
-                    {result.finalReviewQuestions.map((card, i) => (
-                      <FlashCardItem
-                        key={i}
-                        card={card}
-                        index={i}
-                        globalIndex={getGlobalIndexForReview() + (result.crossSectionConnections?.length || 0) + i}
-                        revealedCards={revealedCards}
-                        onToggle={toggleCard}
-                      />
-                    ))}
-                  </div>
-                </CollapsibleSection>
+                  {result.finalReviewQuestions && result.finalReviewQuestions.length > 0 && (
+                    <CollapsibleSection title="Final Review Questions" icon="🏁" defaultOpen={true}>
+                      <div className="flashcard-grid">
+                        {result.finalReviewQuestions.map((card, i) => (
+                          <FlashCardItem
+                            key={i}
+                            card={card}
+                            index={i}
+                            globalIndex={getGlobalIndexForReview() + (result.crossSectionConnections?.length || 0) + i}
+                            revealedCards={revealedCards}
+                            onToggle={toggleCard}
+                          />
+                        ))}
+                      </div>
+                    </CollapsibleSection>
+                  )}
+                </>
               )}
             </div>
           )}
