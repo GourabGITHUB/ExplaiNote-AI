@@ -4,9 +4,14 @@ import * as pdfjsLib from 'pdfjs-dist';
 // ✅ This is the correct way to reference the worker in Vite
 // The file is served from /public folder as a static asset
 const PDFJS_VERSION = pdfjsLib.version;
-
-// ✅ Set worker ONCE at module level, not inside the function
-pdfjsLib.GlobalWorkerOptions.workerSrc = `/pdf.worker.min.mjs`;
+// ── 🚀 FIXED: LET VITE MANAGE THE WORKER ROUTING AUTOMATICALLY ──
+// This tells Vite to treat the package worker file as an isolated web worker bundle asset.
+if (typeof window !== 'undefined' && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+    'pdfjs-dist/build/pdf.worker.mjs',
+    import.meta.url
+  ).toString();
+}
 
 export async function parseFile(file: File): Promise<string> {
   const ext = file.name.split('.').pop()?.toLowerCase();
