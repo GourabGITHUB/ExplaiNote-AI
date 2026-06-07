@@ -1,6 +1,7 @@
 // src/components/HomePage.tsx
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom'; // Import Link component for SEO routing
+import { createPortal } from 'react-dom'; 
 
 const faqs = [
   {
@@ -27,10 +28,101 @@ const faqs = [
 
 export default function HomePage() {
   const [openFaq, setOpenFaq] = useState<number | null>(0);
+const [bannerStatus, setBannerStatus] = useState<'visible' | 'fading' | 'hidden'>('hidden');
 
-  return (
+  useEffect(() => {
+    const isBannerDismissed = localStorage.getItem('desktop_hint_dismissed');
+    
+    if (!isBannerDismissed) {
+      setBannerStatus('visible');
+
+      // Start the fade-out phase after 5 seconds
+      const timer = setTimeout(() => {
+        triggerFadeOut();
+      }, 5000);
+
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  const triggerFadeOut = () => {
+    setBannerStatus('fading');
+    // Wait 400ms for the CSS transition to complete before removing from DOM
+    setTimeout(() => {
+      setBannerStatus('hidden');
+      localStorage.setItem('desktop_hint_dismissed', 'true');
+    }, 400);
+  };
+
+    return (
     <div className="page-container">
-      {/* Hero */}
+      {/* Injecting media query to enforce desktop hidden rule dynamically */}
+      <style>{`
+        @media (min-width: 768px) {
+          .desktop-hint-banner {
+            display: none !important;
+          }
+        }
+      `}</style>
+
+  {/* Minimal Auto-Dismiss Mobile Banner rendered outside the page container */}
+{/* Minimal Auto-Dismiss Mobile Banner rendered outside the page container */}
+{bannerStatus !== 'hidden' && createPortal(
+  <div 
+    className="desktop-hint-banner"
+    style={{
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      backgroundColor: '#1e1e24', 
+      color: '#ffffff',
+      padding: '14px 16px',
+      fontSize: '13px',
+      fontWeight: '500',
+      textAlign: 'center',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: '8px',
+      zIndex: 99999, 
+      boxShadow: '0 4px 12px rgba(0,0,0,0.3)',
+      borderBottom: '1px solid rgba(255,255,255,0.1)',
+      
+      // Smooth Transition logic
+      transition: 'opacity 400ms ease, transform 400ms ease',
+      opacity: bannerStatus === 'visible' ? 1 : 0,
+      transform: bannerStatus === 'visible' ? 'translateY(0)' : 'translateY(-10px)',
+    }}
+  >
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#60a5fa" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink: 0 }}>
+      <rect x="2" y="3" width="20" height="14" rx="2" ry="2"/>
+      <line x1="8" y1="21" x2="16" y2="21"/>
+      <line x1="12" y1="17" x2="12" y2="21"/>
+    </svg>
+    <span style={{ paddingRight: '8px' }}>For the best experience, try ExplaiNote on desktop.</span>
+    <button 
+      onClick={triggerFadeOut} // Triggers the smooth exit animation
+      style={{
+        background: 'none',
+        border: 'none',
+        color: 'rgba(255,255,255,0.6)',
+        fontSize: '18px',
+        cursor: 'pointer',
+        marginLeft: 'auto',
+        padding: '0 4px',
+        lineHeight: 1,
+        flexShrink: 0
+      }}
+      aria-label="Dismiss banner"
+    >
+      ×
+    </button>
+  </div>,
+  document.body
+)}
+
+    {/* Hero */}
       <div className="home-hero">
         <div className="home-hero-badge">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
@@ -122,47 +214,47 @@ export default function HomePage() {
         Frequently Asked Questions
       </h2>
       <div className="faq-list">
-  {faqs.map((faq, i) => (
-    <div
-      key={i}
-      className={`faq-item ${openFaq === i ? 'open' : ''}`}
-    >
-      <button
-        className="faq-question"
-        onClick={() => setOpenFaq(openFaq === i ? null : i)}
-        aria-expanded={openFaq === i}
-      >
-        <span>{faq.q}</span>
-
-        <span className="faq-chevron">
-          <svg
-            width="12"
-            height="12"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
+        {faqs.map((faq, i) => (
+          <div
+            key={i}
+            className={`faq-item ${openFaq === i ? 'open' : ''}`}
           >
-            <polyline points="6 9 12 15 18 9" />
-          </svg>
-        </span>
-      </button>
+            <button
+              className="faq-question"
+              onClick={() => setOpenFaq(openFaq === i ? null : i)}
+              aria-expanded={openFaq === i}
+            >
+              <span>{faq.q}</span>
 
-      <div className="faq-answer">
-        {faq.a}
+              <span className="faq-chevron">
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </span>
+            </button>
+
+            <div className="faq-answer">
+              {faq.a}
+            </div>
+          </div>
+        ))}
       </div>
-    </div>
-  ))}
-</div>
       {/* Footer */}
-<footer className="home-footer">
-  <p>
-    © 2026 ExplaiNote AI ·{' '}
-    <Link to="/privacy">Privacy Policy</Link>
-  </p>
-</footer>
+      <footer className="home-footer">
+        <p>
+          © 2026 ExplaiNote AI ·{' '}
+          <Link to="/privacy">Privacy Policy</Link>
+        </p>
+      </footer>
     </div>
   );
 }

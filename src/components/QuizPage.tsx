@@ -769,7 +769,7 @@ export default function QuizPage({ apiKey, onApiKeyChange, onProjectUpdate, acti
         />
         <span className="upload-zone-icon">📂</span>
         <h3>Drop your document here</h3>
-        <p>or click here to browse — supports PDF, DOCX, TXT</p>
+        <p>or <b>click here</b> to browse — supports PDF, DOCX, TXT</p>
       </div>
 
       {file && (

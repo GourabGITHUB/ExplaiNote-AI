@@ -34,7 +34,7 @@ Hosting & Serverless: Cloudflare Pages & Cloudflare Workers (HTMLRewriter middle
 
 🛠️ Local Development
 
-git clone https://github.com/gourabGITHUB/explainote-ai.git
+git clone https://github.com/GourabGITHUB/ExplaiNote-AI
 cd explainote-ai
 
 npm install
