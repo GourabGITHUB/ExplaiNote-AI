@@ -1727,6 +1727,7 @@ b {color: #29C43E }
     background-color: var(--bg-card); /* Keeps a solid background underneath the sticky buttons */
     z-index: 10;
   }
+  .tab-content{margin-bottom: 35px}
 
 }
 

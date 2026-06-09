@@ -503,7 +503,7 @@ export default function RecallPage({ apiKey, onApiKeyChange, onProjectUpdate, ac
       <DictionaryTooltip containerRef={pageRef} />
 
       <div className="page-header">
-        <h1>Active Recall Studio</h1>
+        <h1>Active Recall Space</h1>
         <p>Paste your study material and let AI create simplified summaries and comprehensive recall exercises.</p>
       </div>
 
